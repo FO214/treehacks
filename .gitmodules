@@ -1,0 +1,3 @@
+[submodule "treehacks-agent-repo"]
+	path = treehacks-agent-repo
+	url = git@github.com:iankorovinsky/treehacks-agent-repo.git
