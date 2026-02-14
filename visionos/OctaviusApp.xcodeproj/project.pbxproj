@@ -237,7 +237,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_ASSET_PATHS = "\"OctaviusApp/Preview Content\"";
-				DEVELOPMENT_TEAM = 48WF2BR29Y;
+				DEVELOPMENT_TEAM = PFR5GV6RMT;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "$(TARGET_NAME)/Info.plist";
@@ -246,7 +246,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = rachelzhangdev.OctaviusApp;
+				PRODUCT_BUNDLE_IDENTIFIER = aarhamdev.OctaviusApp;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = "xros xrsimulator";
 				SWIFT_EMIT_LOC_STRINGS = YES;
@@ -263,7 +263,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_ASSET_PATHS = "\"OctaviusApp/Preview Content\"";
-				DEVELOPMENT_TEAM = 48WF2BR29Y;
+				DEVELOPMENT_TEAM = PFR5GV6RMT;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "$(TARGET_NAME)/Info.plist";
@@ -272,7 +272,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = rachelzhangdev.OctaviusApp;
+				PRODUCT_BUNDLE_IDENTIFIER = aarhamdev.OctaviusApp;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = "xros xrsimulator";
 				SWIFT_EMIT_LOC_STRINGS = YES;
