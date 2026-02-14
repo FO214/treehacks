@@ -12,11 +12,7 @@ No GitHub, no frontend, no database—just **directory in, PNG out**.
 
 ## Install
 
-```bash
-cd repo-to-png
-pip install -e .
-```
-
+From the project root, install server deps (`pip install -r server/requirements.txt`).  
 Install mermaid-cli (required for PNG output):
 
 ```bash
@@ -25,39 +21,24 @@ npm install -g @mermaid-js/mermaid-cli
 
 ## Usage
 
-### CLI
+Call the pipeline from another component via the single function in the server:
 
-```bash
-# Output to diagram.png (default)
-python -m repo_to_png /path/to/your/project
+```python
+from server.diagram import repo_to_png
 
-# Custom output path
-python -m repo_to_png ./my-app -o arch.png
-
-# With OpenAI key (if not in OPENAI_API_KEY)
-python -m repo_to_png . --openai-key sk-xxx
+# Returns (png_bytes, component_positions); optionally writes to file
+png_bytes, positions = repo_to_png("/path/to/project", output_path="diagram.png")
 ```
 
 The directory must contain a README (e.g. `README.md`, `README`).
 
-### Python API
+Lower-level pieces (if you need them) are in `repo_to_png`:
 
 ```python
-from repo_to_png import repo_to_png
-
-# Returns PNG bytes, optionally writes to file
-png_bytes = repo_to_png("/path/to/project", output_path="diagram.png")
-```
-
-Or use the pipeline and renderer separately:
-
-```python
-from repo_to_png import run_pipeline, mermaid_to_png
+from server.repo_to_png import run_pipeline, mermaid_to_png
 
 result = run_pipeline("/path/to/project")
-png_bytes = mermaid_to_png(result.mermaid)
-with open("diagram.png", "wb") as f:
-    f.write(png_bytes)
+png_bytes, positions = mermaid_to_png(result.mermaid)
 ```
 
 ## Environment
