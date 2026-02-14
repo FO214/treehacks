@@ -60,7 +60,18 @@ if __name__ == "__main__":
             if sys.argv[i].startswith("--"):
                 key = sys.argv[i][2:]
                 if i + 1 < len(sys.argv):
-                    args[key] = sys.argv[i + 1]
+                    val = sys.argv[i + 1]
+                    # Convert booleans and ints
+                    if val.lower() in ("true", "1", "yes"):
+                        val = True
+                    elif val.lower() in ("false", "0", "no"):
+                        val = False
+                    else:
+                        try:
+                            val = int(val)
+                        except ValueError:
+                            pass
+                    args[key] = val
                     i += 2
                 else:
                     i += 1
