@@ -9,13 +9,9 @@ import SwiftUI
 import RealityKit
 
 struct ContentView: View {
-    @Environment(AppModel.self) private var appModel
-
     var body: some View {
         VStack(spacing: 20) {
             ToggleImmersiveSpaceButton()
-            Button("Build an AI agent") { appModel.addAgent() }
-                .disabled(appModel.immersiveSpaceState != .open)
         }
         .padding()
     }
