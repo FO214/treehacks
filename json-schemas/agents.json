@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents",
+  "title": "Agents",
+  "description": "List of agents and their current status - Server → Vision Pro",
+  "type": "object",
+  "required": ["agents"],
+  "properties": {
+    "agents": {
+      "type": "array",
+      "description": "List of agents with their current status",
+      "items": {
+        "type": "object",
+        "required": ["id", "status"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Unique agent identifier"
+          },
+          "name": {
+            "type": "string",
+            "description": "Display name for the agent"
+          },
+          "status": {
+            "type": "string",
+            "enum": ["coding", "creating_pr", "testing", "idle", "error"],
+            "description": "Current agent status"
+          },
+          "details": {
+            "type": "string",
+            "description": "Optional status details (e.g. file being edited, PR URL)"
+          }
+        }
+      }
+    }
+  }
+}

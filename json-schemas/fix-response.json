@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "fix-response",
+  "title": "FixResponse",
+  "description": "Response from POST /fix - Server → Vision Pro",
+  "type": "object",
+  "required": ["success", "result"],
+  "properties": {
+    "success": {
+      "type": "boolean",
+      "description": "Whether the fix completed successfully"
+    },
+    "result": {
+      "type": "string",
+      "description": "Result text (PR link, diff summary, etc.)"
+    },
+    "error": {
+      "type": "string",
+      "description": "Error message if success is false"
+    }
+  }
+}
