@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import tiktoken
 from dotenv import load_dotenv
@@ -8,7 +9,9 @@ from openai import OpenAI
 
 from .format_message import format_user_message
 
-load_dotenv()
+# Load .env from project root
+env_path = Path(__file__).parent.parent.parent / ".env"
+load_dotenv(env_path)
 
 
 class OpenAIService:
@@ -42,7 +45,6 @@ class OpenAIService:
                 {"role": "user", "content": user_message},
             ],
             "max_completion_tokens": 12000,
-            "temperature": 0.2,
         }
         if reasoning_effort:
             payload["reasoning_effort"] = reasoning_effort

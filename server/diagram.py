@@ -5,8 +5,8 @@ Runs the pipeline (file tree + README → OpenAI → Mermaid → PNG) and return
 import io
 from pathlib import Path
 
-from .repo_to_png.mermaid_to_png import ComponentPosition, mermaid_to_png
-from .repo_to_png.pipeline import run_pipeline
+from repo_to_png.mermaid_to_png import ComponentPosition, mermaid_to_png
+from repo_to_png.pipeline import run_pipeline
 
 # PNG size from mermaid_to_png
 _DEFAULT_WIDTH = 1920
