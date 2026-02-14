@@ -1,12 +1,19 @@
 """
 TreeHacks Fix Agent MCP Server
 Exposes the Modal + Claude Agent SDK functionality via FastMCP tools.
+
+After the agent applies a fix, the server automatically creates a branch,
+commits, pushes, and opens a GitHub pull request.
 """
+import json
 import os
+import re
 import subprocess
 import sys
+import time
+import urllib.request
 
-# Load keys from poke-mcp/.env (ANTHROPIC_API_KEY, MODAL_*, POKE_*, etc.)
+# Load keys from poke-mcp/.env (ANTHROPIC_API_KEY, MODAL_*, GITHUB_TOKEN, etc.)
 try:
     from dotenv import load_dotenv
     _env_path = os.path.join(os.path.dirname(__file__), ".env")
@@ -25,19 +32,146 @@ mcp = FastMCP("TreeHacks Fix Agent")
 # Default repository for testing
 DEFAULT_REPO_URL = "https://github.com/iankorovinsky/treehacks-agent-repo"
 
-# System prompt: frames the task for fix/change flows (make modification, open PR, etc.)
+# System prompt: frames the task for fix/change flows (make the modification only,
+# the server handles branching/committing/PR automatically).
 FIX_SYSTEM_PROMPT = """You are a code assistant working in a cloned repository. Your task is to:
 1. Make the modification or fix requested by the user.
-2. After making changes, create a new branch, commit your changes, and open a pull request (e.g. via gh pr create if available, or describe the changes so a PR can be opened manually).
-3. Be precise and only change what is needed to fulfill the request."""
+2. Be precise and only change what is needed to fulfill the request.
+Do NOT create branches, commit, or open PRs yourself — that is handled automatically after you finish."""
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _parse_github_owner_repo(repo_url: str) -> tuple[str, str]:
+    """Extract (owner, repo) from a GitHub URL."""
+    m = re.match(r"https?://github\.com/([^/]+)/([^/.]+)", repo_url)
+    if not m:
+        raise ValueError(f"Could not parse GitHub owner/repo from: {repo_url}")
+    return m.group(1), m.group(2)
+
+
+def _slugify(text: str, max_len: int = 40) -> str:
+    """Turn a human sentence into a short branch-safe slug."""
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return slug[:max_len].rstrip("-")
+
+
+def _exec(sb, *args, **kwargs) -> tuple[str, str, int]:
+    """Run a command in the sandbox; return (stdout, stderr, returncode)."""
+    p = sb.exec(*args, **kwargs)
+    p.wait()
+    stdout = p.stdout.read() if hasattr(p.stdout, "read") else ""
+    stderr = p.stderr.read() if hasattr(p.stderr, "read") else ""
+    return stdout, stderr, p.returncode
+
+
+def _create_pr(
+    owner: str,
+    repo: str,
+    branch: str,
+    base: str,
+    title: str,
+    body: str,
+    token: str,
+) -> str:
+    """Create a GitHub pull request via the REST API. Returns the PR URL."""
+    url = f"https://api.github.com/repos/{owner}/{repo}/pulls"
+    payload = json.dumps({
+        "title": title,
+        "head": branch,
+        "base": base,
+        "body": body,
+    }).encode()
+    req = urllib.request.Request(url, data=payload, method="POST", headers={
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github+json",
+        "Content-Type": "application/json",
+    })
+    with urllib.request.urlopen(req) as resp:
+        result = json.loads(resp.read())
+    return result.get("html_url", "")
+
+
+# ---------------------------------------------------------------------------
+# Modal image + inline agent script (claude-agent-sdk, NOT Claude Code CLI)
+# ---------------------------------------------------------------------------
+
+# Lightweight image: Python 3.12, git, claude-agent-sdk, non-root user
+_SANDBOX_IMAGE = None  # built lazily after `import modal`
+
+
+def _get_sandbox_image():
+    """Build (and cache) the Modal sandbox image."""
+    global _SANDBOX_IMAGE
+    if _SANDBOX_IMAGE is None:
+        import modal
+        _SANDBOX_IMAGE = (
+            modal.Image.debian_slim(python_version="3.12")
+            .apt_install("git")
+            .pip_install("claude-agent-sdk")
+            .run_commands("useradd -m -s /bin/bash agent")
+        )
+    return _SANDBOX_IMAGE
+
+
+# Inline agent script executed inside the sandbox.
+# Drops root → agent user (claude-agent-sdk refuses root), then runs the prompt.
+AGENT_SCRIPT = r"""
+import os, pwd, subprocess, sys
+
+# ── Drop root privileges ──────────────────────────────────────────────
+try:
+    _u = pwd.getpwnam("agent")
+    os.setgid(_u.pw_gid)
+    os.initgroups("agent", _u.pw_gid)
+    os.setuid(_u.pw_uid)
+    os.environ["HOME"] = _u.pw_dir
+except (KeyError, PermissionError):
+    pass  # already non-root or user missing
+
+print(f"[agent] uid={os.getuid()} cwd={os.getcwd()} home={os.environ.get('HOME')}", flush=True)
+
+import asyncio
+from claude_agent_sdk import query, ClaudeAgentOptions
+
+async def main():
+    prompt = os.environ.get("AGENT_PROMPT", "List files in this repo.")
+    opts = ClaudeAgentOptions(
+        allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
+        permission_mode="bypassPermissions",
+    )
+    out = []
+    async for message in query(prompt=prompt, options=opts):
+        mtype = type(message).__name__
+        print(f"[agent] {mtype}", flush=True)
+        if hasattr(message, "result") and message.result:
+            out.append(str(message.result))
+
+    # Show what changed
+    print("\n[agent] git status after agent:", flush=True)
+    subprocess.run(["git", "status", "--short"], cwd="/repo")
+    print("[agent] git diff --stat:", flush=True)
+    subprocess.run(["git", "diff", "--stat"], cwd="/repo")
+
+    print("\n--- AGENT RESULT ---\n")
+    print("\n".join(out) if out else "No result output.")
+
+asyncio.run(main())
+"""
 
 
 def run_modal_agent(instruction: str, repo_url: str, system_prompt: str | None = None) -> str:
     """
-    Run the Claude Code agent in a Modal sandbox.
+    Run claude-agent-sdk in a Modal sandbox, then push a branch and open a PR.
 
-    Each call creates a new sandbox, runs the agent, and terminates on completion/error.
-    If system_prompt is provided, it is prepended to the user instruction.
+    Flow:
+      1. Clone repo (authenticated so we can push)
+      2. Create a feature branch
+      3. Run claude-agent-sdk with the user instruction (drops root → agent)
+      4. Stage + commit + push any changes the agent made
+      5. Open a GitHub pull request via the API
     """
     try:
         import modal
@@ -48,64 +182,132 @@ def run_modal_agent(instruction: str, repo_url: str, system_prompt: str | None =
     if not anthropic_key:
         return "Error: ANTHROPIC_API_KEY not set in environment"
 
-    # Look up or create the Modal app (works outside of `modal run`)
-    app = modal.App.lookup("treehacks-fix-agent", create_if_missing=True)
+    github_token = os.environ.get("GITHUB_TOKEN", "")
+    if not github_token:
+        return "Error: GITHUB_TOKEN environment variable is required to push branches and create PRs."
 
-    # Define the sandbox image with Claude Code CLI
-    sandbox_image = (
-        modal.Image.debian_slim(python_version="3.11")
-        .apt_install("git", "curl", "ca-certificates")
-        .run_commands(
-            # Install Node.js 20
-            "curl -fsSL https://deb.nodesource.com/setup_20.x | bash -",
-            "apt-get install -y nodejs",
-            # Install Claude Code CLI globally
-            "npm install -g @anthropic-ai/claude-code",
-        )
-    )
+    # Parse owner/repo for GitHub API + authenticated clone
+    try:
+        owner, repo_name = _parse_github_owner_repo(repo_url)
+    except ValueError as e:
+        return str(e)
+
+    auth_url = f"https://x-access-token:{github_token}@github.com/{owner}/{repo_name}.git"
+    branch_name = f"soot-fix/{_slugify(instruction)}-{int(time.time())}"
+
+    app = modal.App.lookup("treehacks-fix-agent", create_if_missing=True)
+    sandbox_image = _get_sandbox_image()
 
     sb = None
     try:
-        # Create sandbox
-        sb = modal.Sandbox.create(
-            app=app,
-            image=sandbox_image,
-            secrets=[modal.Secret.from_dict({"ANTHROPIC_API_KEY": anthropic_key})],
-            timeout=600,
+        # ── Create sandbox ────────────────────────────────────────────
+        print("[soot] Creating Modal sandbox...", flush=True)
+        with modal.enable_output():
+            sb = modal.Sandbox.create(app=app, image=sandbox_image, timeout=10 * 60)
+        print("[soot] Sandbox created.", flush=True)
+
+        # ── 1. Clone repo (authenticated URL so we can push later) ────
+        print(f"[soot] Cloning {owner}/{repo_name}...", flush=True)
+        _, stderr, rc = _exec(sb, "git", "clone", auth_url, "/repo", timeout=120)
+        if rc != 0:
+            return f"Clone failed: {stderr}"
+        print("[soot] Clone complete.", flush=True)
+
+        # ── 2. Detect default branch & create feature branch ─────────
+        base_branch_out, _, _ = _exec(
+            sb, "git", "rev-parse", "--abbrev-ref", "HEAD", workdir="/repo",
+        )
+        base_branch = base_branch_out.strip() or "main"
+
+        _exec(sb, "git", "config", "user.name", "Soot Fix Agent", workdir="/repo")
+        _exec(sb, "git", "config", "user.email", "agent@treehacks.dev", workdir="/repo")
+        _exec(sb, "git", "checkout", "-b", branch_name, workdir="/repo")
+        print(f"[soot] Created branch: {branch_name} (base: {base_branch})", flush=True)
+
+        # ── 3. Run agent (drops root → agent inside the script) ──────
+        _exec(sb, "chown", "-R", "agent:agent", "/repo")
+
+        # Build the full prompt (prepend system prompt if provided)
+        full_prompt = f"{system_prompt}\n\nUser request: {instruction}" if system_prompt else instruction
+
+        prompt_secret = modal.Secret.from_dict({"AGENT_PROMPT": full_prompt})
+        try:
+            anthropic_secret = modal.Secret.from_name(
+                "anthropic-secret", required_keys=["ANTHROPIC_API_KEY"],
+            )
+        except Exception:
+            anthropic_secret = modal.Secret.from_dict(
+                {"ANTHROPIC_API_KEY": anthropic_key},
+            )
+
+        print("[soot] Running claude-agent-sdk...", flush=True)
+        agent_p = sb.exec(
+            "python", "-c", AGENT_SCRIPT,
+            workdir="/repo",
+            timeout=300,
+            secrets=[prompt_secret, anthropic_secret],
+        )
+        agent_p.wait()
+        agent_stdout = agent_p.stdout.read()
+        agent_stderr = agent_p.stderr.read() if hasattr(agent_p, "stderr") else ""
+
+        if agent_p.returncode != 0:
+            return f"Agent exited {agent_p.returncode}\nstderr: {agent_stderr}\nstdout: {agent_stdout}"
+        print("[soot] Agent finished.", flush=True)
+
+        # ── 4. Check for changes ─────────────────────────────────────
+        # After chown to agent, root needs safe.directory to use git
+        _exec(sb, "git", "config", "--global", "--add", "safe.directory", "/repo")
+        diff_out, _, _ = _exec(sb, "git", "diff", "--stat", workdir="/repo")
+        status_out, _, _ = _exec(sb, "git", "status", "--porcelain", workdir="/repo")
+
+        if not diff_out.strip() and not status_out.strip():
+            return f"Agent completed but made no file changes.\n\n{agent_stdout}"
+
+        # ── 5. Stage, commit, push ───────────────────────────────────
+        _exec(sb, "git", "add", "-A", workdir="/repo")
+
+        commit_msg = f"fix: {instruction[:72]}"
+        _, stderr, rc = _exec(sb, "git", "commit", "-m", commit_msg, workdir="/repo")
+        if rc != 0:
+            return f"Commit failed: {stderr}\n\n{agent_stdout}"
+
+        print(f"[soot] Pushing branch {branch_name}...", flush=True)
+        _, stderr, rc = _exec(
+            sb, "git", "push", "origin", branch_name, workdir="/repo", timeout=120,
+        )
+        if rc != 0:
+            return f"Push failed: {stderr}\n\n{agent_stdout}"
+        print("[soot] Push complete.", flush=True)
+
+        # ── 6. Open pull request ─────────────────────────────────────
+        pr_title = f"soot-fix: {instruction[:100]}"
+        pr_body = (
+            f"## Instructions\n\n"
+            f"{instruction}\n\n"
+            f"---\n\n"
+            f"*Opened by [Soot](https://github.com/apps/soot-fix)*"
         )
 
-        # Clone the repository
-        clone_proc = sb.exec("git", "clone", repo_url, "/workspace/repo")
-        clone_proc.wait()
-        if clone_proc.returncode != 0:
-            stderr = clone_proc.stderr.read()
-            return f"Error cloning repo: {stderr}"
+        print(f"[soot] Opening PR on {owner}/{repo_name}...", flush=True)
+        try:
+            pr_url = _create_pr(
+                owner, repo_name, branch_name, base_branch,
+                pr_title, pr_body, github_token,
+            )
+        except Exception as e:
+            return (
+                f"Changes pushed to branch `{branch_name}` but PR creation failed: {e}\n\n"
+                f"{agent_stdout}"
+            )
 
-        # Run Claude Code agent with optional system prompt + user instruction
-        # The agent has access to tools: Read, Write, Edit, Bash, Glob, Grep
-        prompt = f"{system_prompt}\n\nUser request: {instruction}" if system_prompt else instruction
-        agent_proc = sb.exec(
-            "claude",
-            "-p", prompt,
-            "--output-format", "text",
-            "--verbose",
-            workdir="/workspace/repo"
-        )
-        agent_proc.wait()
-
-        stdout = agent_proc.stdout.read()
-        stderr = agent_proc.stderr.read()
-
-        if agent_proc.returncode != 0:
-            return f"Agent error (exit {agent_proc.returncode}):\n{stderr}\n\nOutput:\n{stdout}"
-
-        return stdout if stdout else "Agent completed with no output"
+        print(f"[soot] PR created: {pr_url}", flush=True)
+        return f"PR created: {pr_url}\nBranch: {branch_name}\n\n{agent_stdout}"
 
     except Exception as e:
         return f"Error: {str(e)}"
 
     finally:
-        # Always terminate the sandbox
         if sb:
             try:
                 sb.terminate()
@@ -116,17 +318,18 @@ def run_modal_agent(instruction: str, repo_url: str, system_prompt: str | None =
 @mcp.tool()
 def run_fix(instruction: str, repo_url: str = DEFAULT_REPO_URL) -> str:
     """
-    Run a fix instruction in a Modal sandbox with Claude Agent SDK.
+    Run a fix instruction in a Modal sandbox with Claude Agent SDK, then push a branch and open a PR.
 
     This creates a sandboxed environment, clones the specified repository,
-    and runs the Claude Agent SDK with your instruction to make changes.
+    runs the Claude Agent SDK with your instruction, and automatically
+    commits, pushes, and opens a GitHub pull request with the changes.
 
     Args:
         instruction: What to fix or change (e.g., "Fix the bug in auth.py" or "Add a test for login")
-        repo_url: Git repository URL to clone (defaults to treehacks-agent-repo)
+        repo_url: GitHub HTTPS URL to clone (defaults to treehacks-agent-repo)
 
     Returns:
-        The output from the agent execution
+        The PR URL and agent output
     """
     try:
         result = run_modal_agent(
@@ -134,21 +337,21 @@ def run_fix(instruction: str, repo_url: str = DEFAULT_REPO_URL) -> str:
             repo_url=repo_url,
             system_prompt=FIX_SYSTEM_PROMPT,
         )
-        return f"Fix completed!\n\n{result}"
+        return result
     except Exception as e:
-        return f"Error running fix: {str(e)}\n\nMake sure Modal is configured and ANTHROPIC_API_KEY is set."
+        return f"Error running fix: {str(e)}\n\nMake sure Modal is configured, ANTHROPIC_API_KEY and GITHUB_TOKEN are set."
 
 
 @mcp.tool()
 def run_fix_default_repo(instruction: str) -> str:
     """
-    Quick fix on the default TreeHacks agent repository.
+    Quick fix on the default TreeHacks agent repository, with automatic PR.
 
     Args:
         instruction: What to fix or change in the default repo
 
     Returns:
-        The output from the agent execution
+        The PR URL and agent output
     """
     try:
         result = run_modal_agent(
@@ -156,7 +359,7 @@ def run_fix_default_repo(instruction: str) -> str:
             repo_url=DEFAULT_REPO_URL,
             system_prompt=FIX_SYSTEM_PROMPT,
         )
-        return f"Fix completed on default repo!\n\n{result}"
+        return result
     except Exception as e:
         return f"Error running fix: {str(e)}"
 
