@@ -26,10 +26,7 @@ struct treehacks26App: App {
         ImmersiveSpace(id: appModel.immersiveSpaceID) {
             ImmersiveView()
                 .environment(appModel)
-                .onAppear {
-                    appModel.immersiveSpaceState = .open
-                    avPlayerViewModel.play()
-                }
+                .onAppear { appModel.immersiveSpaceState = .open }
                 .onDisappear {
                     appModel.immersiveSpaceState = .closed
                     avPlayerViewModel.reset()
