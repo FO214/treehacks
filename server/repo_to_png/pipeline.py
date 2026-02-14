@@ -1,7 +1,7 @@
 """
 Core pipeline: read directory from disk → 3-step OpenAI → Mermaid diagram string.
 """
-import re
+import time
 from pathlib import Path
 from typing import NamedTuple
 
@@ -18,17 +18,6 @@ class PipelineResult(NamedTuple):
     mermaid: str
     explanation: str
     component_mapping: str
-
-
-def _process_click_events(diagram: str, base_url: str) -> str:
-    """Rewrite click paths to full URLs (file:// for local)."""
-    def replace_path(match: re.Match) -> str:
-        path = match.group(2).strip("\"'")
-        full_url = f"{base_url.rstrip('/')}/{path}"
-        return f'click {match.group(1)} "{full_url}"'
-
-    click_pattern = r'click ([^\s"]+)\s+"([^"]+)"'
-    return re.sub(click_pattern, replace_path, diagram)
 
 
 def run_pipeline(
@@ -53,7 +42,10 @@ def run_pipeline(
             f"Directory too large (>{token_limit} tokens). Use a smaller tree or exclude more paths."
         )
 
+    api_time_total = 0.0
+
     # Step 1: explanation
+    t0 = time.perf_counter()
     explanation = openai.completion(
         model=model,
         system_prompt=SYSTEM_FIRST_PROMPT,
@@ -61,8 +53,10 @@ def run_pipeline(
         api_key=openai_api_key,
         reasoning_effort="medium",
     )
+    api_time_total += time.perf_counter() - t0
 
     # Step 2: component mapping
+    t0 = time.perf_counter()
     full_second = openai.completion(
         model=model,
         system_prompt=SYSTEM_SECOND_PROMPT,
@@ -70,6 +64,7 @@ def run_pipeline(
         api_key=openai_api_key,
         reasoning_effort="low",
     )
+    api_time_total += time.perf_counter() - t0
     start_tag, end_tag = "<component_mapping>", "</component_mapping>"
     start_idx = full_second.find(start_tag)
     end_idx = full_second.find(end_tag)
@@ -80,6 +75,7 @@ def run_pipeline(
     )
 
     # Step 3: Mermaid diagram
+    t0 = time.perf_counter()
     mermaid_code = openai.completion(
         model=model,
         system_prompt=SYSTEM_THIRD_PROMPT,
@@ -87,9 +83,10 @@ def run_pipeline(
         api_key=openai_api_key,
         reasoning_effort="low",
     )
+    api_time_total += time.perf_counter() - t0
     mermaid_code = mermaid_code.replace("```mermaid", "").replace("```", "").strip()
-    file_base_url = directory.as_uri()
-    mermaid_code = _process_click_events(mermaid_code, file_base_url)
+
+    print(f"OpenAI API calls total time: {api_time_total:.2f}s")
 
     return PipelineResult(
         mermaid=mermaid_code,
