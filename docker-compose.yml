@@ -1,0 +1,31 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    ports:
+      - "8000:8000"
+    environment:
+      MCP_HTTP_URL: ${MCP_HTTP_URL}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      MODAL_TOKEN_ID: ${MODAL_TOKEN_ID}
+      MODAL_TOKEN_SECRET: ${MODAL_TOKEN_SECRET}
+    volumes:
+      - .:/app
+
+  mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile.mcp
+    command: ["python", "-m", "mcp_server.main"]
+    ports:
+      - "8001:8001"
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8001
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      MODAL_TOKEN_ID: ${MODAL_TOKEN_ID}
+      MODAL_TOKEN_SECRET: ${MODAL_TOKEN_SECRET}
+      MCP_HTTP_URL: ${MCP_HTTP_URL}
+    volumes:
+      - .:/app
