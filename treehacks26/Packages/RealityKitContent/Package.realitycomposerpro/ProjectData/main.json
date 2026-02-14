@@ -1,0 +1,13 @@
+{
+  "pathsToIds" : {
+    "RealityKitContent\/Sources\/RealityKitContent\/RealityKitContent.rkassets\/Ground\/Ground.usda" : "AC3EA5A0-F06C-4A0F-99B4-05AEF069D93D",
+    "RealityKitContent\/Sources\/RealityKitContent\/RealityKitContent.rkassets\/Immersive.usda" : "C6A7F375-BFE9-46E0-9EA6-1A6B150F43FD",
+    "RealityKitContent\/Sources\/RealityKitContent\/RealityKitContent.rkassets\/Untitled%20Scene.usda" : "7A84FEF9-6B4F-4139-BC75-1E2ABF09076E"
+  },
+  "projectID" : -4632413430669476531,
+  "uuidToIntID" : {
+    "7A84FEF9-6B4F-4139-BC75-1E2ABF09076E" : 1964090258374796225,
+    "AC3EA5A0-F06C-4A0F-99B4-05AEF069D93D" : 6664756976464825888,
+    "C6A7F375-BFE9-46E0-9EA6-1A6B150F43FD" : 3550086944070944212
+  }
+}
