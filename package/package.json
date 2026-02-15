@@ -1,0 +1,51 @@
+{
+  "name": "poke",
+  "version": "0.2.5",
+  "type": "module",
+  "description": "Poke.com Developer SDK",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "bin": {
+    "poke": "./dist/cli.cjs"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc --noEmit && tsc --emitDeclarationOnly --outDir dist && node esbuild.config.js",
+    "dev": "tsx src/cli.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.14.1",
+    "@types/ws": "^8.5.10",
+    "commander": "^12.1.0",
+    "esbuild": "^0.25.3",
+    "open": "^10.0.0",
+    "qrcode-terminal": "^0.12.0",
+    "tsx": "^4.16.2",
+    "typescript": "^5.8.2",
+    "ws": "^8.16.0"
+  },
+  "keywords": [
+    "poke",
+    "cli",
+    "tunnel",
+    "localhost",
+    "mcp"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  }
+}

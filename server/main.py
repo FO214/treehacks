@@ -1,7 +1,15 @@
 """
-FastAPI server: accepts text_input (fix instruction), calls MCP server tool run_fix.
+FastAPI server: /fix, voice endpoints, demo. Single server on port 8000.
 """
 import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Load .env from repo root (parent of server/)
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
+import asyncio
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -10,6 +18,8 @@ from fastapi.responses import PlainTextResponse
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 from pydantic import BaseModel
+
+from . import voice
 
 
 class FixRequest(BaseModel):
@@ -21,6 +31,16 @@ class FixResponse(BaseModel):
     success: bool
     result: str
     error: str | None = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    voice.voice_startup()
+    if voice.TALKBACK_ENABLED and voice.TTS_LOOP_AUTOSTART:
+        loop = asyncio.get_running_loop()
+        voice.start_tts_loop(loop)
+    yield
+    voice.stop_tts_loop()
 
 
 @asynccontextmanager
@@ -53,19 +73,11 @@ async def call_run_fix(text_input: str, repo_url: str | None) -> str:
     return "\n".join(out_parts) if out_parts else ""
 
 
-app = FastAPI(title="Fix API", description="Accepts fix instruction, calls MCP server (Modal + Claude Agent SDK).")
-
-# Demo: Vision Pro block color (0 or 1). Toggles on each request for demo visibility.
-_demo_value = 0
-
-
-@app.get("/demo/value")
-async def get_demo_value() -> dict:
-    """Return value 0 or 1 for Vision Pro demo block color. Toggles each request."""
-    global _demo_value
-    val = _demo_value
-    _demo_value = 1 - _demo_value
-    return {"value": val}
+app = FastAPI(
+    title="TreeHacks API",
+    description="Fix API + voice server (record, STT, Poke, TTS).",
+    lifespan=lifespan,
+)
 
 
 @app.post("/fix", response_class=PlainTextResponse)
@@ -76,3 +88,127 @@ async def fix(request: FixRequest) -> str:
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# Demo: Vision Pro block color (WebSocket rainbow)
+import colorsys
+import json as _json
+from fastapi import WebSocket
+
+
+async def _ws_send_rainbow(websocket: WebSocket) -> None:
+    """Send rainbow colors in a loop."""
+    hue = 0.0
+    while True:
+        r, g, b = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
+        msg = {"r": int(r * 255), "g": int(g * 255), "b": int(b * 255)}
+        await websocket.send_text(_json.dumps(msg))
+        hue = (hue + 0.01) % 1.0
+        await asyncio.sleep(0.05)
+
+
+async def _ws_receive_loop(websocket: WebSocket) -> None:
+    """Receive messages from client and print to console."""
+    while True:
+        data = await websocket.receive_text()
+        print(f"[ws] client → server: {data}")
+
+
+@app.websocket("/ws/demo")
+async def websocket_demo(websocket: WebSocket):
+    """Stream rainbow colors to clients; receive gesture/status messages from clients."""
+    await websocket.accept()
+    try:
+        await asyncio.gather(
+            _ws_send_rainbow(websocket),
+            _ws_receive_loop(websocket),
+        )
+    except Exception:
+        pass
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
+# Voice endpoints
+@app.get("/health")
+async def health():
+    return voice.get_health()
+
+
+@app.post("/record-once")
+async def record_once(body: dict | None = None):
+    opts = body or {}
+    try:
+        result = await voice.run_record_turn_once(
+            send_to_poke=opts.get("sendToPoke", True),
+            talkback=opts.get("talkback", True),
+            await_inbound=opts.get("awaitInbound", True),
+            timeout_ms=opts.get("timeoutMs"),
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/stt")
+async def stt(body: dict):
+    audio_path = body.get("audioPath")
+    if not audio_path:
+        raise HTTPException(status_code=400, detail="audioPath is required")
+    try:
+        transcript = await voice.transcribe_file(audio_path)
+        return {"ok": True, "transcript": transcript}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/tts")
+async def tts(body: dict):
+    text = (body.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+    try:
+        await voice.speak_text_direct(text)
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/queue")
+async def queue():
+    return voice.get_queue()
+
+
+@app.post("/queue/speak-next")
+async def queue_speak_next():
+    msg = await voice.speak_next_from_queue()
+    if msg is None:
+        raise HTTPException(status_code=404, detail="queue empty")
+    return {"ok": True, "message": msg}
+
+
+@app.post("/tts/start-loop")
+async def tts_start_loop():
+    loop = asyncio.get_running_loop()
+    voice.start_tts_loop(loop)
+    return {"ok": True, "started": True, "running": voice._tts_loop_running}
+
+
+@app.post("/tts/stop-loop")
+async def tts_stop_loop():
+    voice.stop_tts_loop()
+    return {"ok": True, "stopped": True, "running": False}
+
+
+@app.get("/tts/loop-status")
+async def tts_loop_status():
+    return {
+        "ok": True,
+        "running": voice._tts_loop_running,
+        "busy": voice._tts_loop_busy,
+        "isBusy": voice._is_busy,
+        "queueSize": len(voice._inbound_queue),
+    }

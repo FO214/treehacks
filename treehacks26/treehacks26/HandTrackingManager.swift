@@ -9,8 +9,10 @@ import SwiftUI
 @Observable
 @MainActor
 final class HandTrackingManager {
+    /// Create fresh instances each time - ARKitSession cannot be restarted after stop()
     private var arSession = ARKitSession()
     private var handTracking = HandTrackingProvider()
+    private var processTask: Task<Void, Never>?
 
     private(set) var isTracking = false
     private(set) var lastGestureTime: Date?
@@ -33,20 +35,26 @@ final class HandTrackingManager {
             isTracking = true
             print("[HandTracking] Started hand tracking")
 
-            await processHandUpdates()
+            processTask = Task { await processHandUpdates(handTracking) }
         } catch {
             print("[HandTracking] Failed to start: \(error)")
         }
     }
 
     func stopTracking() {
+        processTask?.cancel()
+        processTask = nil
         arSession.stop()
         isTracking = false
+        // Create fresh instances for next start - ARKitSession cannot be restarted after stop()
+        arSession = ARKitSession()
+        handTracking = HandTrackingProvider()
         print("[HandTracking] Stopped hand tracking")
     }
 
-    private func processHandUpdates() async {
-        for await update in handTracking.anchorUpdates {
+    private func processHandUpdates(_ provider: HandTrackingProvider) async {
+        for await update in provider.anchorUpdates {
+            guard !Task.isCancelled else { return }
             guard update.event == .updated else { continue }
 
             let anchor = update.anchor
@@ -102,11 +110,9 @@ final class HandTrackingManager {
             tip = .littleFingerTip
         }
 
-        guard let knuckleJoint = skeleton.joint(knuckle),
-              let intermediateJoint = skeleton.joint(intermediate),
-              let tipJoint = skeleton.joint(tip) else {
-            return false
-        }
+        let knuckleJoint = skeleton.joint(knuckle)
+        let intermediateJoint = skeleton.joint(intermediate)
+        let tipJoint = skeleton.joint(tip)
 
         // Get positions
         let knucklePos = knuckleJoint.anchorFromJointTransform.columns.3
@@ -130,11 +136,9 @@ final class HandTrackingManager {
     }
 
     private func isThumbExtended(skeleton: HandSkeleton) -> Bool {
-        guard let knuckleJoint = skeleton.joint(.thumbKnuckle),
-              let tipJoint = skeleton.joint(.thumbTip),
-              let wristJoint = skeleton.joint(.wrist) else {
-            return false
-        }
+        let knuckleJoint = skeleton.joint(.thumbKnuckle)
+        let tipJoint = skeleton.joint(.thumbTip)
+        let wristJoint = skeleton.joint(.wrist)
 
         // For thumb, check if tip is far enough from wrist
         let tipPos = tipJoint.anchorFromJointTransform.columns.3
