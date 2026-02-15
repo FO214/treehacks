@@ -20,3 +20,23 @@ struct WebView: UIViewRepresentable {
         webView.load(URLRequest(url: url))
     }
 }
+
+/// WebView with a close button; persists until user taps close.
+struct WebViewWithClose: View {
+    let url: URL?
+    let onClose: () -> Void
+
+    var body: some View {
+        ZStack(alignment: .topTrailing) {
+            WebView(url: url)
+            Button(action: onClose) {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 44))
+                    .symbolRenderingMode(.hierarchical)
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .padding(16)
+        }
+    }
+}

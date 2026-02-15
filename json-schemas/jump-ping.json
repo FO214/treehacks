@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "jump-ping",
+  "title": "JumpPing",
+  "description": "Server → Vision Pro: Signal to make the palm tree jump smoothly",
+  "type": "object",
+  "required": ["type"],
+  "properties": {
+    "type": {
+      "const": "jump_ping",
+      "description": "Message type"
+    }
+  }
+}

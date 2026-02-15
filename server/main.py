@@ -132,6 +132,14 @@ async def websocket_demo(websocket: WebSocket):
             pass
 
 
+async def _ws_send_jump_ping(websocket: WebSocket) -> None:
+    """Send jump_ping every 2 seconds to make the palm tree jump."""
+    while True:
+        msg = {"type": "jump_ping"}
+        await websocket.send_text(_json.dumps(msg))
+        await asyncio.sleep(2.0)
+
+
 async def _ws_send_agent_cycle(websocket: WebSocket) -> None:
     """Send agent lifecycle messages: create_agent_thinking → agent_start_working → agent_start_testing.
     Cycles through agents 1-9 for each phase.
@@ -166,10 +174,13 @@ async def _ws_send_agent_cycle(websocket: WebSocket) -> None:
 
 @app.websocket("/ws/spawn")
 async def websocket_spawn(websocket: WebSocket):
-    """Stream agent lifecycle messages to Vision Pro (create → working → testing)."""
+    """Stream agent lifecycle messages and jump_ping to Vision Pro."""
     await websocket.accept()
     try:
-        await _ws_send_agent_cycle(websocket)
+        await asyncio.gather(
+            _ws_send_agent_cycle(websocket),
+            _ws_send_jump_ping(websocket),
+        )
     except Exception:
         pass
     finally:

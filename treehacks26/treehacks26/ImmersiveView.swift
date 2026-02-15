@@ -31,14 +31,25 @@ final class DemoBlockState {
     var webviewEntities: [Int: Entity] = [:]
     var planeAnchor: AnchorEntity?
     var whiteboardEntity: Entity?
-    /// Cached character.usdz; cloned when spawning.
+    /// Palm tree in corner of floor (for jump_ping animation).
+    var palmTreeEntity: Entity?
+    /// Cached character.usdc; cloned when spawning.
     var characterTemplate: Entity?
-    /// Cached computer_desk.usdz; used for static desks.
+    /// Cached computerSpawn_2.usdz; used for static desks.
     var computerDeskTemplate: Entity?
     /// When true, root follows gaze (where user is looking) instead of hand.
     var isRepositioningMode = false
     /// True after we've placed root near user; avoids spawn at plane anchor center (often far away).
     var hasInitialPlacement = false
+
+    /// User closed the webview for this agent; hide webview and remove character.
+    func closeWebview(agentId: Int) {
+        testingWebviewURLs.removeValue(forKey: agentId)
+        webviewEntities[agentId]?.removeFromParent()
+        characterEntities[agentId]?.removeFromParent()
+        characterEntities.removeValue(forKey: agentId)
+        agentStates.removeValue(forKey: agentId)
+    }
 }
 
 struct ImmersiveView: View {
@@ -71,7 +82,7 @@ struct ImmersiveView: View {
         for row in 0..<gridCols {
             for col in 0..<gridCols {
                 positions.append([
-                    Float(col) * gridSpacing - half,
+                    half - Float(col) * gridSpacing,  // flipped horizontal
                     targetBoundsSize / 2, // sit on floor
                     Float(row) * gridSpacing - half
                 ])
@@ -148,10 +159,10 @@ struct ImmersiveView: View {
 
             // Load templates and create 9 static desks (computer on desk)
             Task { @MainActor in
-                if let character = try? await Entity(named: "character.usdz", in: realityKitContentBundle) {
+                if let character = try? await Entity(named: "character.usdc", in: realityKitContentBundle) {
                     blockState.characterTemplate = character
                 }
-                if let computer = try? await Entity(named: "computer_desk.usdz", in: realityKitContentBundle),
+                if let computer = try? await Entity(named: "computerSpawn_2.usdz", in: realityKitContentBundle),
                    let root = blockState.rootEntity {
                     // Create 9 static desks at grid positions (never removed)
                     for i in 0..<Self.maxAgents {
@@ -163,6 +174,24 @@ struct ImmersiveView: View {
                         root.addChild(desk)
                         Self.scaleToBoundsSize(desk, targetSize: Self.targetBoundsSize * Self.deskAndCharacterSizeMultiplier)
                     }
+
+                    // Palm tree: same position and bounding box as first desk (slot 0)
+                    let gridPos0 = Self.gridPositions[0]
+                    let deskY = Self.targetBoundsSize / 2 + 1.2 - 0.5
+                    let deskTargetSize = Self.targetBoundsSize * Self.deskAndCharacterSizeMultiplier
+                    let palmTree: Entity
+                    if let model = try? await Entity(named: "palmtreelowpolygon.usdz", in: realityKitContentBundle) {
+                        palmTree = model.clone(recursive: true)
+                        Self.scaleToBoundsSize(palmTree, targetSize: deskTargetSize)
+                    } else {
+                        palmTree = Self.makePalmTreePlaceholder()
+                        Self.scaleToBoundsSize(palmTree, targetSize: deskTargetSize)
+                    }
+                    palmTree.name = "palm_tree"
+                    let palmDir = simd_normalize(SIMD3<Float>(gridPos0.x, 0, gridPos0.z))
+                    palmTree.position = [gridPos0.x + palmDir.x * 2, deskY, gridPos0.z + palmDir.z * 2]  // 2m farther from grid
+                    root.addChild(palmTree)
+                    blockState.palmTreeEntity = palmTree
                 }
             }
 
@@ -210,9 +239,12 @@ struct ImmersiveView: View {
         } attachments: {
             ForEach(1...Self.maxAgents, id: \.self) { agentId in
                 Attachment(id: "webview_\(agentId)") {
-                    WebView(url: URL(string: blockState.testingWebviewURLs[agentId] ?? "https://google.com"))
-                        .frame(width: 400, height: 300)
-                        .glassBackgroundEffect()
+                    WebViewWithClose(
+                        url: URL(string: blockState.testingWebviewURLs[agentId] ?? "https://google.com"),
+                        onClose: { blockState.closeWebview(agentId: agentId) }
+                    )
+                    .frame(width: 2000, height: 1500)
+                    .glassBackgroundEffect()
                 }
             }
         }
@@ -253,6 +285,7 @@ struct ImmersiveView: View {
             blockState.webviewEntities = [:]
             blockState.planeAnchor = nil
             blockState.whiteboardEntity = nil
+            blockState.palmTreeEntity = nil
             blockState.characterTemplate = nil
             blockState.computerDeskTemplate = nil
             blockState.hasInitialPlacement = false
@@ -273,6 +306,13 @@ struct ImmersiveView: View {
     private static func makePlaceholderDesk() -> Entity {
         let mesh = MeshResource.generateBox(width: 0.06 * Self.scaleFactor, height: 0.06 * Self.scaleFactor, depth: 0.06 * Self.scaleFactor)
         let mat = SimpleMaterial(color: .systemBrown, isMetallic: false)
+        return ModelEntity(mesh: mesh, materials: [mat])
+    }
+
+    /// Placeholder palm tree (green cylinder) when palm model is not available.
+    private static func makePalmTreePlaceholder() -> Entity {
+        let mesh = MeshResource.generateCylinder(height: 1.0, radius: 0.1)
+        let mat = SimpleMaterial(color: .systemGreen, isMetallic: false)
         return ModelEntity(mesh: mesh, materials: [mat])
     }
 
@@ -313,19 +353,22 @@ struct ImmersiveView: View {
                     case .string(let text):
                         if let data = text.data(using: .utf8),
                            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                           let type = json["type"] as? String,
-                           let agentId = json["agent_id"] as? Int, (1...9).contains(agentId) {
-                            switch type {
-                            case "create_agent_thinking":
-                                await handleCreateAgentThinking(agentId: agentId, taskName: json["task_name"] as? String ?? "")
-                            case "agent_start_working":
-                                await handleAgentStartWorking(agentId: agentId)
-                            case "agent_start_testing":
-                                let vercel = json["vercel_link"] as? String ?? ""
-                                let browserbase = json["browserbase_link"] as? String ?? ""
-                                await handleAgentStartTesting(agentId: agentId, vercelLink: vercel, browserbaseLink: browserbase)
-                            default:
-                                break
+                           let type = json["type"] as? String {
+                            if type == "jump_ping" {
+                                await handleJumpPing()
+                            } else if let agentId = json["agent_id"] as? Int, (1...9).contains(agentId) {
+                                switch type {
+                                case "create_agent_thinking":
+                                    await handleCreateAgentThinking(agentId: agentId, taskName: json["task_name"] as? String ?? "")
+                                case "agent_start_working":
+                                    await handleAgentStartWorking(agentId: agentId)
+                                case "agent_start_testing":
+                                    let vercel = json["vercel_link"] as? String ?? ""
+                                    let browserbase = json["browserbase_link"] as? String ?? ""
+                                    await handleAgentStartTesting(agentId: agentId, vercelLink: vercel, browserbaseLink: browserbase)
+                                default:
+                                    break
+                                }
                             }
                         }
                     case .data:
@@ -347,7 +390,9 @@ struct ImmersiveView: View {
         await MainActor.run {
             guard let root = blockState.rootEntity else { return }
 
-            // Remove existing character at this slot if any
+            // Remove existing character and any open webview at this slot
+            blockState.testingWebviewURLs.removeValue(forKey: agentId)
+            blockState.webviewEntities[agentId]?.removeFromParent()
             if let existing = blockState.characterEntities[agentId] {
                 existing.removeFromParent()
                 blockState.characterEntities.removeValue(forKey: agentId)
@@ -378,14 +423,35 @@ struct ImmersiveView: View {
         }
     }
 
+    private func handleJumpPing() async {
+        await MainActor.run {
+            guard let palmTree = blockState.palmTreeEntity, let parent = palmTree.parent else { return }
+            let jumpHeight: Float = 0.5
+            let duration: TimeInterval = 0.25
+
+            var upTransform = palmTree.transform
+            upTransform.translation.y += jumpHeight
+            palmTree.move(to: upTransform, relativeTo: parent, duration: duration, timingFunction: .easeOut)
+
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(duration))
+                var downTransform = palmTree.transform
+                downTransform.translation.y -= jumpHeight
+                palmTree.move(to: downTransform, relativeTo: parent, duration: duration, timingFunction: .easeIn)
+            }
+        }
+    }
+
     private func handleAgentStartWorking(agentId: Int) async {
         await MainActor.run {
+            guard blockState.agentStates[agentId] == .thinking else { return }
             blockState.agentStates[agentId] = .working
         }
     }
 
     private func handleAgentStartTesting(agentId: Int, vercelLink: String, browserbaseLink: String) async {
         await MainActor.run {
+            guard blockState.agentStates[agentId] == .working else { return }
             blockState.agentStates[agentId] = .testing
             guard let character = blockState.characterEntities[agentId] else { return }
 
@@ -393,11 +459,11 @@ struct ImmersiveView: View {
             blockState.testingWebviewURLs[agentId] = vercelLink
             if let webviewEntity = blockState.webviewEntities[agentId] {
                 webviewEntity.removeFromParent()
-                webviewEntity.position = [0, 1.5, 0]  // 1.5m above character
+                webviewEntity.position = [0, 1.0, 1.0]  // 1m above character, 1m forward (Z)
                 character.addChild(webviewEntity)
             }
 
-            // Smooth jump 1m upward, then delete
+            // Smooth jump 1m upward; character stays until user closes webview
             let currentTransform = character.transform
             var targetTransform = currentTransform
             targetTransform.translation.y += 1.0  // 1m up
@@ -406,10 +472,14 @@ struct ImmersiveView: View {
 
             Task { @MainActor in
                 try? await Task.sleep(for: .seconds(0.9))  // Wait for animation
-                character.removeFromParent()
-                blockState.characterEntities.removeValue(forKey: agentId)
-                blockState.agentStates.removeValue(forKey: agentId)
-                blockState.testingWebviewURLs.removeValue(forKey: agentId)
+                // Reparent webview to root so it persists (user closes manually; character stays until then)
+                if let webviewEntity = blockState.webviewEntities[agentId], let root = blockState.rootEntity {
+                    let worldPos = webviewEntity.position(relativeTo: nil)
+                    let localPos = root.convert(position: worldPos, from: nil)
+                    webviewEntity.removeFromParent()
+                    webviewEntity.position = localPos
+                    root.addChild(webviewEntity)
+                }
             }
         }
     }

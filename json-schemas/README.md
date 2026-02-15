@@ -16,3 +16,4 @@ Use these schemas to:
 | `agent-create-thinking.json` | Server → Vision Pro: Create agent in thinking state (agent_id 1-9, task_name) |
 | `agent-start-working.json` | Server → Vision Pro: Agent starts working (agent_id 1-9) |
 | `agent-start-testing.json` | Server → Vision Pro: Agent starts testing (agent_id, vercel_link, browserbase_link) |
+| `jump-ping.json` | Server → Vision Pro: Signal to make the palm tree jump smoothly |
