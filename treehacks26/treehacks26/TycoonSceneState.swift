@@ -18,7 +18,7 @@ final class TycoonSceneState {
     func ensureTables(count: Int, contentBundle: Bundle) async {
         guard let tables = tablesContainer else { return }
         while allocator.tablesSpawned < count {
-            await allocator.spawnNextTable(in: tables, contentBundle: contentBundle)
+            _ = await allocator.spawnNextTable(in: tables, contentBundle: contentBundle)
         }
         lastSpawnedCount = count
     }

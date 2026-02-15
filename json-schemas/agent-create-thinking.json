@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent-create-thinking",
+  "title": "CreateAgentThinking",
+  "description": "Server → Vision Pro: Create new agent in thinking state",
+  "type": "object",
+  "required": ["type", "agent_id", "task_name"],
+  "properties": {
+    "type": { "const": "create_agent_thinking", "description": "Message type" },
+    "agent_id": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9,
+      "description": "Agent id 1-9 (position in 3x3 grid)"
+    },
+    "task_name": {
+      "type": "string",
+      "description": "Task name for the agent"
+    }
+  }
+}

@@ -132,6 +132,53 @@ async def websocket_demo(websocket: WebSocket):
             pass
 
 
+async def _ws_send_agent_cycle(websocket: WebSocket) -> None:
+    """Send agent lifecycle messages: create_agent_thinking → agent_start_working → agent_start_testing.
+    Cycles through agents 1-9 for each phase.
+    """
+    while True:
+        # Phase 1: create_agent_thinking for each agent 1-9
+        for agent_id in range(1, 10):
+            msg = {
+                "type": "create_agent_thinking",
+                "agent_id": agent_id,
+                "task_name": "placeholder task",
+            }
+            await websocket.send_text(_json.dumps(msg))
+            await asyncio.sleep(0.5)
+        # Phase 2: agent_start_working for each agent 1-9
+        for agent_id in range(1, 10):
+            msg = {"type": "agent_start_working", "agent_id": agent_id}
+            await websocket.send_text(_json.dumps(msg))
+            await asyncio.sleep(0.5)
+        # Phase 3: agent_start_testing for each agent 1-9
+        for agent_id in range(1, 10):
+            msg = {
+                "type": "agent_start_testing",
+                "agent_id": agent_id,
+                "vercel_link": "https://google.com",
+                "browserbase_link": "https://google.com",
+            }
+            await websocket.send_text(_json.dumps(msg))
+            await asyncio.sleep(0.5)
+        await asyncio.sleep(2.0)  # Pause before next cycle
+
+
+@app.websocket("/ws/spawn")
+async def websocket_spawn(websocket: WebSocket):
+    """Stream agent lifecycle messages to Vision Pro (create → working → testing)."""
+    await websocket.accept()
+    try:
+        await _ws_send_agent_cycle(websocket)
+    except Exception:
+        pass
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
 # Voice endpoints
 @app.get("/health")
 async def health():

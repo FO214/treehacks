@@ -17,4 +17,12 @@ enum APIConfig {
             .replacingOccurrences(of: "http://", with: "ws://")
         return URL(string: "\(s)/ws/demo")
     }
+
+    /// WebSocket URL for spawn agent commands (slot 1-9).
+    static var wsSpawnURL: URL? {
+        let s = baseURL
+            .replacingOccurrences(of: "https://", with: "wss://")
+            .replacingOccurrences(of: "http://", with: "ws://")
+        return URL(string: "\(s)/ws/spawn")
+    }
 }
