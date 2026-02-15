@@ -59,7 +59,8 @@ const CHAT_DB_PATH = process.env.CHAT_DB_PATH || path.join(os.homedir(), "Librar
 const POKE_HANDLE_ID = Number(process.env.POKE_HANDLE_ID || "0");
 const CHAT_POLL_MS = Number(process.env.CHAT_POLL_MS || "1000");
 const RESPONSE_TIMEOUT_MS = Number(process.env.RESPONSE_TIMEOUT_MS || "120000");
-const HTTP_PORT = Number(process.env.VOICE_HTTP_PORT || "8787");
+const HTTP_PORT = Number(process.env.VOICE_HTTP_PORT || process.env.PORT || "8000");
+const FASTAPI_URL = (process.env.FASTAPI_URL || "http://127.0.0.1:8002").replace(/\/$/, "");
 
 const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
 const groq = GROQ_API_KEY ? new Groq({ apiKey: GROQ_API_KEY }) : null;
@@ -707,6 +708,29 @@ function startHttpServer() {
   const app = express();
   app.use(express.json({ limit: "1mb" }));
 
+  // Demo: Vision Pro block color (0 or 1)
+  let _demoValue = 0;
+  app.get("/demo/value", (req, res) => {
+    const val = _demoValue;
+    _demoValue = 1 - _demoValue;
+    res.json({ value: val });
+  });
+
+  // Proxy /fix to FastAPI (MCP + agent)
+  app.post("/fix", async (req, res) => {
+    try {
+      const r = await fetch(`${FASTAPI_URL}/fix`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(req.body || {}),
+      });
+      const text = await r.text();
+      res.status(r.status).send(text);
+    } catch (err) {
+      res.status(503).json({ error: "FastAPI unreachable", detail: err?.message });
+    }
+  });
+
   app.get("/health", (req, res) => {
     res.status(200).json({
       ok: true,
@@ -811,7 +835,7 @@ function startHttpServer() {
 
   app.listen(HTTP_PORT, () => {
     console.log(`[http] listening on :${HTTP_PORT}`);
-    console.log("[http] endpoints: POST /record-once, POST /stt, POST /tts, GET /queue, GET /health, POST /tts/start-loop, POST /tts/stop-loop, GET /tts/loop-status");
+    console.log("[http] endpoints: GET /demo/value, POST /fix (→FastAPI), POST /record-once, POST /stt, POST /tts, GET /queue, GET /health, ...");
   });
 }
 
