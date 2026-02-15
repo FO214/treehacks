@@ -48,6 +48,8 @@ final class DemoBlockState {
     var computerDeskTemplate: Entity?
     /// Thinking indicator entities per agent (child of character); shaken in update loop.
     var thinkingIndicatorEntities: [Int: Entity] = [:]
+    /// 3D circle indicators on whiteboard for each running agent (agent_id -> Entity).
+    var whiteboardAgentIndicators: [Int: Entity] = [:]
     /// When true, root follows gaze (where user is looking) instead of hand.
     var isRepositioningMode = false
     /// True after we've placed root near user; avoids spawn at plane anchor center (often far away).
@@ -65,6 +67,8 @@ final class DemoBlockState {
         webviewEntities[agentId]?.removeFromParent()
         thinkingIndicatorEntities[agentId]?.removeFromParent()
         thinkingIndicatorEntities.removeValue(forKey: agentId)
+        whiteboardAgentIndicators[agentId]?.removeFromParent()
+        whiteboardAgentIndicators.removeValue(forKey: agentId)
         characterEntities[agentId]?.removeFromParent()
         characterEntities.removeValue(forKey: agentId)
         agentStates.removeValue(forKey: agentId)
@@ -236,6 +240,8 @@ struct ImmersiveView: View {
             // SceneEvents.Update may run off main thread; HandTrackingManager is @MainActor
             updateSubscription = content.subscribe(to: SceneEvents.Update.self) { _ in
                 Task { @MainActor in
+                    syncWhiteboardIndicators()
+
                     // Shake thinking indicators
                     let t = Float(ProcessInfo.processInfo.systemUptime)
                     for (_, entity) in blockState.thinkingIndicatorEntities {
@@ -383,6 +389,7 @@ struct ImmersiveView: View {
             blockState.characterEntities = [:]
             blockState.agentStates = [:]
             blockState.thinkingIndicatorEntities = [:]
+            blockState.whiteboardAgentIndicators = [:]
             blockState.testingWebviewURLs = [:]
             blockState.webviewEntities = [:]
             blockState.planeAnchor = nil
@@ -429,6 +436,66 @@ struct ImmersiveView: View {
         let mesh = MeshResource.generateSphere(radius: size / 2)
         let mat = SimpleMaterial(color: .systemYellow, isMetallic: false)
         return ModelEntity(mesh: mesh, materials: [mat])
+    }
+
+    /// Color for whiteboard agent indicator by agent ID (1-9).
+    private static func colorForAgentId(_ agentId: Int) -> UIColor {
+        switch agentId {
+        case 1: return .systemRed
+        case 2: return .systemOrange
+        case 3: return .systemYellow
+        case 4: return .systemGreen
+        case 5: return .systemTeal
+        case 6: return .systemBlue
+        case 7: return .systemPurple
+        case 8: return .systemPink
+        case 9: return .systemIndigo
+        default: return .systemGray
+        }
+    }
+
+    /// Creates a flat 3D circle (thin cylinder) for whiteboard agent indicator.
+    private static func makeAgentCircleIndicator(agentId: Int) -> Entity {
+        let radius: Float = 0.025 * Self.scaleFactor
+        let height: Float = 0.002 * Self.scaleFactor  // Very thin disk
+        let mesh = MeshResource.generateCylinder(height: height, radius: radius)
+        let mat = SimpleMaterial(color: Self.colorForAgentId(agentId), isMetallic: false)
+        let entity = ModelEntity(mesh: mesh, materials: [mat])
+        entity.name = "whiteboard_indicator_\(agentId)"
+        // Rotate so flat face is in XY (facing user); cylinder default axis is Y
+        entity.orientation = simd_quatf(angle: .pi / 2, axis: [1, 0, 0])
+        return entity
+    }
+
+    /// Syncs whiteboard circle indicators with running agents. Call when characterEntities changes.
+    private func syncWhiteboardIndicators() {
+        guard let whiteboard = blockState.whiteboardEntity else { return }
+        let runningIds = Set(blockState.characterEntities.keys)
+
+        // Remove indicators for agents no longer running
+        let toRemove = blockState.whiteboardAgentIndicators.keys.filter { !runningIds.contains($0) }
+        for agentId in toRemove {
+            blockState.whiteboardAgentIndicators[agentId]?.removeFromParent()
+            blockState.whiteboardAgentIndicators.removeValue(forKey: agentId)
+        }
+
+        // Add indicators for newly running agents
+        let circleSpacing: Float = 0.06 * Self.scaleFactor
+        let gridOriginX: Float = 0.35 * Self.scaleFactor  // Right of diagram center
+        for agentId in runningIds {
+            if blockState.whiteboardAgentIndicators[agentId] == nil {
+                let circle = Self.makeAgentCircleIndicator(agentId: agentId)
+                let col = (agentId - 1) % 3
+                let row = (agentId - 1) / 3
+                circle.position = [
+                    gridOriginX + (Float(col) - 1) * circleSpacing,
+                    (Float(row) - 1) * circleSpacing,
+                    0.02 * Self.scaleFactor  // In front of whiteboard face
+                ]
+                whiteboard.addChild(circle)
+                blockState.whiteboardAgentIndicators[agentId] = circle
+            }
+        }
     }
 
     /// Scales an entity so its visual bounding box fits within a cube of the given size.
@@ -642,6 +709,8 @@ struct ImmersiveView: View {
         var targetTransform = container.transform
         targetTransform.translation = [gridPos.x, targetY, gridPos.z + characterZOffset]
         container.move(to: targetTransform, relativeTo: root, duration: 0.6, timingFunction: .easeOut)
+
+        syncWhiteboardIndicators()
     }
 
     /// Attaches webview and jumps container up; used when entering testing state.
