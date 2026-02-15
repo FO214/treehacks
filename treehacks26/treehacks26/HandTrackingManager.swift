@@ -28,8 +28,14 @@ final class HandTrackingManager {
     private var lastDebugLogTime: Date?
     private let debugLogInterval: TimeInterval = 1.5
 
-    /// Endpoint to call when open palm is detected
+    /// When true, open palm triggers drag callback instead of trigger callback
+    var isRepositioningMode = false
+
+    /// Called when open palm detected (normal mode) - debounced
     var onOpenPalmDetected: (() async -> Void)?
+
+    /// Called every frame when open palm in repositioning mode - receives HandAnchor for chirality
+    var onOpenPalmForDrag: ((HandAnchor) -> Void)?
 
     func startTracking() async {
         guard HandTrackingProvider.isSupported else {
@@ -88,7 +94,11 @@ final class HandTrackingManager {
             }
 
             // Check for open palm gesture
-            if isOpenPalm(anchor: anchor) {
+            guard isOpenPalm(anchor: anchor) else { continue }
+
+            if isRepositioningMode {
+                onOpenPalmForDrag?(anchor)
+            } else {
                 await handleOpenPalmDetected()
             }
         }

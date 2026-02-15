@@ -5,11 +5,16 @@
 
 import SwiftUI
 import RealityKit
+import ARKit
 
-/// Holds the demo block entity so we can update its material when value changes.
+/// Holds the root anchor entity (invisible), child cube entities, and plane anchor.
 @Observable
 final class DemoBlockState {
-    var entity: ModelEntity?
+    /// Invisible root entity anchored to surface; children are positioned relative to this.
+    var rootEntity: Entity?
+    /// Child cubes in a grid; these are the ones that cycle color.
+    var childEntities: [ModelEntity] = []
+    var planeAnchor: AnchorEntity?
 }
 
 struct ImmersiveView: View {
@@ -20,60 +25,136 @@ struct ImmersiveView: View {
     @State private var handTrackingManager = HandTrackingManager()
     @State private var wsTask: URLSessionWebSocketTask?
     @State private var setupTask: Task<Void, Never>?
+    @State private var spawnTask: Task<Void, Never>?
+    @State private var repositioningMode = false
+
+    private static let maxAgents = 9
+    private static let gridCols = 3
+    private static let cubeSize: Float = 0.06
+    private static let gridSpacing: Float = 0.08
+
+    /// 3×3 grid positions (floor of root), row-major order.
+    private static var gridPositions: [SIMD3<Float>] {
+        let half = Float(gridCols - 1) * gridSpacing / 2
+        var positions: [SIMD3<Float>] = []
+        for row in 0..<gridCols {
+            for col in 0..<gridCols {
+                positions.append([
+                    Float(col) * gridSpacing - half,
+                    cubeSize / 2, // sit on floor
+                    Float(row) * gridSpacing - half
+                ])
+            }
+        }
+        return positions
+    }
 
     var body: some View {
         // IMPORTANT: Initial closure must NOT capture boxColor. If it does, SwiftUI may
         // recreate the entire RealityView when boxColor changes, causing the box to disappear briefly.
         RealityView { content in
-            // Cube (0.4m) that snaps to a detected horizontal surface (table/floor)
-            let cube = MeshResource.generateBox(size: [0.4, 0.4, 0.4])
-            let material = SimpleMaterial(color: .systemRed, isMetallic: false)
-            let entity = ModelEntity(mesh: cube, materials: [material])
-            entity.name = "demoBlock"
+            // Root entity: invisible anchor for children, sits on surface (no mesh)
+            let root = Entity()
+            root.name = "demoRoot"
+            root.position = [0, 0.2, 0]
+
+            // Children are spawned one per second by spawnTask (max 9, then reset)
 
             // Plane anchor: snaps to nearest horizontal surface (table, floor, etc.)
             let anchor = AnchorEntity(.plane(.horizontal, classification: .any, minimumBounds: [0.4, 0.4]))
-            // Offset cube up by half its height so it sits ON the surface
-            entity.position = [0, 0.2, 0]
-            anchor.addChild(entity)
+            anchor.addChild(root)
             content.add(anchor)
 
-            blockState.entity = entity
+            blockState.rootEntity = root
+            blockState.childEntities = []
+            blockState.planeAnchor = anchor
         } update: { _ in
-            guard let entity = blockState.entity else { return }
-            guard var modelComponent = entity.components[ModelComponent.self] else { return }
             let newMaterial = SimpleMaterial(color: boxColor, isMetallic: false)
-            modelComponent.materials = [newMaterial]
-            entity.components[ModelComponent.self] = modelComponent
+            for entity in blockState.childEntities {
+                guard var modelComponent = entity.components[ModelComponent.self] else { continue }
+                modelComponent.materials = [newMaterial]
+                entity.components[ModelComponent.self] = modelComponent
+            }
         }
         .overlay(alignment: .topLeading) {
-            Button {
-                Task { @MainActor in
-                    appModel.immersiveSpaceState = .inTransition
-                    await dismissImmersiveSpace()
+            HStack(spacing: 12) {
+                Button {
+                    Task { @MainActor in
+                        appModel.immersiveSpaceState = .inTransition
+                        await dismissImmersiveSpace()
+                    }
+                } label: {
+                    Label("Exit", systemImage: "xmark.circle.fill")
                 }
-            } label: {
-                Label("Exit", systemImage: "xmark.circle.fill")
+                .buttonStyle(.borderedProminent)
+
+                Button {
+                    repositioningMode.toggle()
+                    handTrackingManager.isRepositioningMode = repositioningMode
+                } label: {
+                    Label(repositioningMode ? "Done" : "Reposition", systemImage: repositioningMode ? "checkmark.circle.fill" : "hand.draw.fill")
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(repositioningMode ? .green : .blue)
             }
-            .buttonStyle(.borderedProminent)
             .padding(24)
+            .glassBackgroundEffect()
         }
         .onAppear {
             startWebSocket()
+            startSpawnLoop()
             // Defer hand tracking so the box renders first (ARKit session can delay initial render)
+            // Skip on simulator: hand tracking is not supported and produces "not authorized" errors
+            #if !targetEnvironment(simulator)
             setupTask = Task {
-                try? await Task.sleep(for: .seconds(1.5))
+                try? await Task.sleep(for: .seconds(2.0))
                 guard !Task.isCancelled else { return }
                 setupHandTracking()
             }
+            #endif
         }
         .onDisappear {
+            spawnTask?.cancel()
+            spawnTask = nil
             setupTask?.cancel()
             setupTask = nil
             wsTask?.cancel(with: .goingAway, reason: nil)
             wsTask = nil
             handTrackingManager.stopTracking()
-            blockState.entity = nil
+            blockState.rootEntity = nil
+            blockState.childEntities = []
+            blockState.planeAnchor = nil
+        }
+    }
+
+    private func startSpawnLoop() {
+        spawnTask = Task { @MainActor in
+            // Brief delay so RealityView has time to create root
+            try? await Task.sleep(for: .seconds(0.5))
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1))
+                guard !Task.isCancelled else { return }
+                guard let root = blockState.rootEntity else { continue }
+
+                let count = blockState.childEntities.count
+                if count >= Self.maxAgents {
+                    // Remove all children and reset
+                    for child in blockState.childEntities {
+                        child.removeFromParent()
+                    }
+                    blockState.childEntities = []
+                } else {
+                    // Add one agent at the next grid spot
+                    let pos = Self.gridPositions[count]
+                    let mesh = MeshResource.generateBox(size: [Self.cubeSize, Self.cubeSize, Self.cubeSize])
+                    let material = SimpleMaterial(color: boxColor, isMetallic: false)
+                    let child = ModelEntity(mesh: mesh, materials: [material])
+                    child.name = "agent_\(count)"
+                    child.position = pos
+                    root.addChild(child)
+                    blockState.childEntities.append(child)
+                }
+            }
         }
     }
 
@@ -131,6 +212,24 @@ struct ImmersiveView: View {
         handTrackingManager.onOpenPalmDetected = {
             await sendGestureToServer("open_palm")
             await triggerRecordOnce()
+        }
+
+        handTrackingManager.onOpenPalmForDrag = { handAnchor in
+            guard let root = blockState.rootEntity,
+                  let planeAnchor = blockState.planeAnchor else { return }
+
+            // Get hand position in world space from HandAnchor
+            let t = handAnchor.originFromAnchorTransform
+            let handWorldPos = SIMD3<Float>(t.columns.3.x, t.columns.3.y, t.columns.3.z)
+
+            // Project hand XY straight down to the surface: use hand's X and Z, surface's Y
+            let planeWorldPos = planeAnchor.position(relativeTo: nil)
+            let surfaceY = planeWorldPos.y
+            let projectedWorldPos = SIMD3<Float>(handWorldPos.x, surfaceY, handWorldPos.z)
+
+            // Convert to plane anchor's local space and set root position
+            let localPos = planeAnchor.convert(position: projectedWorldPos, from: nil)
+            root.position = SIMD3<Float>(localPos.x, 0.2, localPos.z)
         }
 
         Task {
