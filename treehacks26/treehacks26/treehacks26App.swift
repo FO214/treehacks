@@ -22,7 +22,6 @@ struct treehacks26App: App {
                     .environment(appModel)
             }
         }
-        .windowStyle(.plain)
         .windowResizability(.contentSize)
         .onChange(of: scenePhase) { _, newPhase in
             if newPhase == .background {

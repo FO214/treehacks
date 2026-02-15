@@ -12,35 +12,33 @@ struct ContentView: View {
     @Environment(AppModel.self) private var appModel
 
     var body: some View {
-        ZStack {
-            Color.black
-                .ignoresSafeArea()
+        HStack(spacing: 12) {
+            Image("palo-alto")
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(height: 84)
 
-            HStack(spacing: 12) {
-                Image("palo-alto")
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-                    .frame(height: 84)
+            VStack(spacing: 8) {
+                ToggleImmersiveSpaceButton()
 
-                VStack(spacing: 8) {
-                    ToggleImmersiveSpaceButton()
-
-                    if appModel.immersiveSpaceState == .open {
-                        Button {
-                            appModel.repositioningMode.toggle()
-                        } label: {
-                            Label(appModel.repositioningMode ? "Done" : "Reposition", systemImage: appModel.repositioningMode ? "checkmark.circle.fill" : "hand.draw.fill")
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .tint(appModel.repositioningMode ? .green : .blue)
+                if appModel.immersiveSpaceState == .open {
+                    Button {
+                        appModel.repositioningMode.toggle()
+                    } label: {
+                        Label(appModel.repositioningMode ? "Done" : "Reposition", systemImage: appModel.repositioningMode ? "checkmark.circle.fill" : "hand.draw.fill")
                     }
+                    .buttonStyle(.borderedProminent)
+                    .tint(appModel.repositioningMode ? .green : .blue)
                 }
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
-            .fixedSize()
         }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .fixedSize()
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color.black)
+        .glassBackgroundEffect(in: .rect(cornerRadius: 16), displayMode: .always)
+        .ignoresSafeArea()
         .persistentSystemOverlays(.hidden)
     }
 }
