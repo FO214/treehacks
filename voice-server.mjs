@@ -10,21 +10,32 @@ import util from "node:util";
 
 import express from "express";
 import OpenAI from "openai";
+import Groq from "groq-sdk";
 import { Poke } from "poke";
 
+const PROVIDER = (process.env.PROVIDER || "openai").toLowerCase();
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 const POKE_API_KEY = process.env.POKE_API_KEY;
 
-if (!OPENAI_API_KEY) {
-  throw new Error("OPENAI_API_KEY is required.");
+if (PROVIDER === "openai" && !OPENAI_API_KEY) {
+  throw new Error("OPENAI_API_KEY is required when PROVIDER=openai.");
+}
+if (PROVIDER === "other" && !GROQ_API_KEY) {
+  throw new Error("GROQ_API_KEY is required when PROVIDER=other.");
+}
+if (PROVIDER === "other" && !ELEVENLABS_API_KEY) {
+  throw new Error("ELEVENLABS_API_KEY is required when PROVIDER=other.");
 }
 if (!POKE_API_KEY) {
   throw new Error("POKE_API_KEY is required.");
 }
 
-const STT_MODEL = process.env.STT_MODEL || "gpt-4o-mini-transcribe";
+const STT_MODEL = process.env.STT_MODEL || (PROVIDER === "other" ? "whisper-large-v3-turbo" : "gpt-4o-mini-transcribe");
 const TTS_MODEL = process.env.TTS_MODEL || "gpt-4o-mini-tts";
-const TTS_VOICE = process.env.TTS_VOICE || "alloy";
+const TTS_VOICE = process.env.TTS_VOICE || (PROVIDER === "other" ? "Rachel" : "alloy");
+const ELEVENLABS_MODEL = process.env.ELEVENLABS_MODEL || "eleven_turbo_v2_5";
 const TTS_SPEED = Number(process.env.TTS_SPEED || "1.0");
 const TTS_RESPONSE_FORMAT_ENV = String(process.env.TTS_RESPONSE_FORMAT || "").trim().toLowerCase();
 const TTS_BATCH_QUEUE = (process.env.TTS_BATCH_QUEUE || "true").toLowerCase() !== "false";
@@ -50,7 +61,8 @@ const CHAT_POLL_MS = Number(process.env.CHAT_POLL_MS || "1000");
 const RESPONSE_TIMEOUT_MS = Number(process.env.RESPONSE_TIMEOUT_MS || "120000");
 const HTTP_PORT = Number(process.env.VOICE_HTTP_PORT || "8787");
 
-const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
+const groq = GROQ_API_KEY ? new Groq({ apiKey: GROQ_API_KEY }) : null;
 const poke = new Poke({ apiKey: POKE_API_KEY });
 
 function hasCommand(command) {
@@ -437,6 +449,16 @@ async function recordUntilPause(outputPath) {
 }
 
 async function transcribeAudio(audioPath) {
+  if (PROVIDER === "other" && groq) {
+    // Use Groq Whisper (faster)
+    const result = await groq.audio.transcriptions.create({
+      file: fs.createReadStream(audioPath),
+      model: STT_MODEL,
+    });
+    return (result.text || "").trim();
+  }
+
+  // Use OpenAI
   const result = await openai.audio.transcriptions.create({
     file: fs.createReadStream(audioPath),
     model: STT_MODEL,
@@ -444,7 +466,76 @@ async function transcribeAudio(audioPath) {
   return (result.text || "").trim();
 }
 
+// ElevenLabs voice name to ID mapping
+const ELEVENLABS_VOICES = {
+  rachel: "21m00Tcm4TlvDq8ikWAM",
+  drew: "29vD33N1CtxCmqQRPOHJ",
+  clyde: "2EiwWnXFnvU5JabPnv8n",
+  paul: "5Q0t7uMcjvnagumLfvZi",
+  domi: "AZnzlk1XvdvUeBnXmlld",
+  dave: "CYw3kZ02Hs0563khs1Fj",
+  fin: "D38z5RcWu1voky8WS1ja",
+  sarah: "EXAVITQu4vr4xnSDxMaL",
+  antoni: "ErXwobaYiN019PkySvjV",
+  thomas: "GBv7mTt0atIp3Br8iCZE",
+  charlie: "IKne3meq5aSn9XLyUdCD",
+  emily: "LcfcDJNUP1GQjkzn1xUU",
+  elli: "MF3mGyEYCl7XYWbV9V6O",
+  callum: "N2lVS1w4EtoT3dr4eOWO",
+  patrick: "ODq5zmih8GrVes37Dizd",
+  harry: "SOYHLrjzK2X1ezoPC6cr",
+  liam: "TX3LPaxmHKxFdv7VOQHJ",
+  dorothy: "ThT5KcBeYPX3keUQqHPh",
+  josh: "TxGEqnHWrfWFTfGW9XjX",
+  arnold: "VR6AewLTigWG4xSOukaG",
+  charlotte: "XB0fDUnXU5powFXDhCwa",
+  alice: "Xb7hH8MSUJpSbSDYk0k2",
+  matilda: "XrExE9yKIg1WjnnlVkGX",
+  james: "ZQe5CZNOzWyzPSCn5a3c",
+  jessica: "cgSgspJ2msm6clMCkdW9",
+  michael: "flq6f7yk4E4fJM5XTYuZ",
+  ethan: "g5CIjZEefAph4nQFvHAz",
+  chris: "iP95p4xoKVk53GoZ742B",
+  brian: "nPczCjzI2devNBz1zQrb",
+  daniel: "onwK4e9ZLuTAKqWW03F9",
+  lily: "pFZP5JQG7iQjIQuC4Bku",
+  bill: "pqHfZKP75CvOlQylNhV4",
+  george: "JBFqnCBsd6RMkjVDRZzb",
+  nicole: "piTKgcLEGmPE4e6mEKli",
+  adam: "pNInz6obpgDQGcFmaJgB",
+};
+
 async function synthesizeSpeech(text, outputPath, responseFormat = "wav") {
+  if (PROVIDER === "other" && ELEVENLABS_API_KEY) {
+    // Use ElevenLabs TTS
+    const voiceId = ELEVENLABS_VOICES[TTS_VOICE.toLowerCase()] || TTS_VOICE;
+    const response = await fetch(
+      `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
+      {
+        method: "POST",
+        headers: {
+          "xi-api-key": ELEVENLABS_API_KEY,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          text,
+          model_id: ELEVENLABS_MODEL,
+          output_format: "mp3_44100_128",
+        }),
+      }
+    );
+
+    if (!response.ok) {
+      const errText = await response.text();
+      throw new Error(`ElevenLabs TTS failed: ${response.status} ${errText}`);
+    }
+
+    const audioBuffer = Buffer.from(await response.arrayBuffer());
+    await fsp.writeFile(outputPath, audioBuffer);
+    return;
+  }
+
+  // Use OpenAI TTS
   const speech = await openai.audio.speech.create({
     model: TTS_MODEL,
     voice: TTS_VOICE,
@@ -461,8 +552,8 @@ async function playAudio(audioPath, responseFormat = "wav") {
     throw new Error("No playback tool found. Use macOS `afplay` or install ffmpeg (`brew install ffmpeg`) for `ffplay`.");
   }
   if (PLAY_BIN === "afplay") {
-    if (responseFormat !== "wav") {
-      throw new Error("afplay only supports wav in this service. Set TTS_RESPONSE_FORMAT=wav or install ffplay.");
+    if (responseFormat !== "wav" && responseFormat !== "mp3") {
+      throw new Error("afplay only supports wav/mp3 in this service. Set TTS_RESPONSE_FORMAT=wav or install ffplay.");
     }
     await runCommand("afplay", [audioPath], { stdio: "inherit" });
     return;
@@ -498,11 +589,13 @@ async function playNotificationSound(fileName) {
 }
 
 async function speakText(text) {
-  const extension = TTS_RESPONSE_FORMAT === "pcm" ? "pcm" : "wav";
+  // ElevenLabs outputs mp3, OpenAI can output wav/pcm
+  const format = PROVIDER === "other" ? "mp3" : TTS_RESPONSE_FORMAT;
+  const extension = format === "pcm" ? "pcm" : format === "mp3" ? "mp3" : "wav";
   const outputPath = tempAudioPath("voice-out", extension);
   try {
-    await synthesizeSpeech(text, outputPath, TTS_RESPONSE_FORMAT);
-    await playAudio(outputPath, TTS_RESPONSE_FORMAT);
+    await synthesizeSpeech(text, outputPath, format);
+    await playAudio(outputPath, format);
   } finally {
     await cleanup(outputPath);
   }
@@ -593,6 +686,7 @@ async function runRecordTurnOnce(options = {}) {
 
 async function startup() {
   console.log("[voice] Service starting.");
+  console.log(`[voice] Provider: ${PROVIDER} (STT: ${PROVIDER === "other" ? "Groq" : "OpenAI"}, TTS: ${PROVIDER === "other" ? "ElevenLabs" : "OpenAI"})`);
   console.log("[voice] Poke client initialized.");
   console.log(`[voice] Recorder: ${RECORD_BIN || "not found"}`);
   console.log(`[voice] Player: ${PLAY_BIN || "not found"}`);
