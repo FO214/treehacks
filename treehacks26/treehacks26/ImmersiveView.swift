@@ -163,7 +163,7 @@ struct ImmersiveView: View {
                         }
                         if let texture, let diagramPlane = Self.makeDiagramPlane(texture: texture) {
                             diagramPlane.name = "diagram"
-                            diagramPlane.position = [0, 0.5 * Self.scaleFactor - 2, -0.15 * Self.scaleFactor]
+                            diagramPlane.position = [0, 0.5 * Self.scaleFactor - 2, -0.15 * Self.scaleFactor - 1.85]  // 1.85m closer to whiteboard (+25cm)
                             anchor.addChild(diagramPlane)
                         }
                     } catch {
@@ -352,13 +352,6 @@ struct ImmersiveView: View {
                 .allowsHitTesting(false)
             }
 
-            // Floating webview: treehacks-agent-repo (interactive mode overlay)
-            WebView(url: URL(string: "https://treehacks-agent-repo.vercel.app"))
-                .frame(width: 600, height: 450)
-                .glassBackgroundEffect(in: .rect(cornerRadius: 16))
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
-                .padding(24)
-
             // Debug overlay: WebSocket status (bottom-left)
             VStack(alignment: .leading, spacing: 4) {
                 Text(blockState.wsConnected ? "WS: connected" : "WS: disconnected")
@@ -428,10 +421,10 @@ struct ImmersiveView: View {
         }
     }
 
-    /// Creates a plane with diagram texture for the whiteboard front (aspect ~3.22:1 from diagram.svg).
+    /// Creates a plane with diagram texture for the whiteboard front (16:9 aspect, half size).
     private static func makeDiagramPlane(texture: TextureResource) -> ModelEntity? {
-        let width: Float = 0.8 * Self.scaleFactor
-        let height: Float = 0.25 * Self.scaleFactor  // ~3.22:1 aspect
+        let width: Float = 0.4 * Self.scaleFactor   // Half of original
+        let height: Float = width * 9 / 16         // 16:9 aspect ratio
         let mesh = MeshResource.generatePlane(width: width, height: height)
         var mat = SimpleMaterial()
         mat.color = .init(tint: .white, texture: .init(texture))

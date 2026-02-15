@@ -12,20 +12,36 @@ struct ContentView: View {
     @Environment(AppModel.self) private var appModel
 
     var body: some View {
-        VStack(spacing: 20) {
-            ToggleImmersiveSpaceButton()
+        ZStack {
+            Color.black
+                .ignoresSafeArea()
 
-            if appModel.immersiveSpaceState == .open {
-                Button {
-                    appModel.repositioningMode.toggle()
-                } label: {
-                    Label(appModel.repositioningMode ? "Done" : "Reposition", systemImage: appModel.repositioningMode ? "checkmark.circle.fill" : "hand.draw.fill")
+            HStack(spacing: 12) {
+                Image("palo-alto")
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(height: 84)
+
+                VStack(spacing: 8) {
+                    ToggleImmersiveSpaceButton()
+
+                    if appModel.immersiveSpaceState == .open {
+                        Button {
+                            appModel.repositioningMode.toggle()
+                        } label: {
+                            Label(appModel.repositioningMode ? "Done" : "Reposition", systemImage: appModel.repositioningMode ? "checkmark.circle.fill" : "hand.draw.fill")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(appModel.repositioningMode ? .green : .blue)
+                    }
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(appModel.repositioningMode ? .green : .blue)
             }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .fixedSize()
         }
-        .padding()
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .persistentSystemOverlays(.hidden)
     }
 }
 
