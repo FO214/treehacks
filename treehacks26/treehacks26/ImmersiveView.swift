@@ -35,8 +35,6 @@ final class DemoBlockState {
     /// Cached webview attachment entities (populated in make closure).
     var webviewEntities: [Int: Entity] = [:]
     var planeAnchor: AnchorEntity?
-    /// Head anchor for repositioning (root moves here when palm open).
-    var headAnchor: AnchorEntity?
     var whiteboardEntity: Entity?
     /// Palm tree in corner of floor (for jump_ping animation).
     var palmTreeEntity: Entity?
@@ -54,9 +52,8 @@ final class DemoBlockState {
     var isRepositioningMode = false
     /// True after we've placed root near user; avoids spawn at plane anchor center (often far away).
     var hasInitialPlacement = false
-    /// Last frame palm state in repositioning mode (for open→closed transition to plop).
-    var wasPalmOpenInRepositioning = false
-
+    /// Previous palm state for repositioning (snap only on open transition).
+    var wasPalmOpenForReposition = false
     /// Debug: last WebSocket message received (shown on-screen).
     var lastWsMessage: String = ""
     /// Debug: WebSocket connection status.
@@ -106,7 +103,7 @@ struct ImmersiveView: View {
         for row in 0..<gridCols {
             for col in 0..<gridCols {
                 positions.append([
-                    Float(col) * gridSpacing - half,  // horizontal (opposite of previous)
+                    half - Float(col) * gridSpacing,  // horizontal (reversed)
                     targetBoundsSize / 2, // sit on floor
                     Float(row) * gridSpacing - half
                 ])
@@ -139,11 +136,6 @@ struct ImmersiveView: View {
             let anchor = AnchorEntity(.plane(.horizontal, classification: .floor, minimumBounds: [0.4 * Self.scaleFactor, 0.4 * Self.scaleFactor]))
             anchor.addChild(root)
             content.add(anchor)
-
-            // Head anchor: for repositioning mode when palm open (root moves here)
-            let head = AnchorEntity(.head)
-            content.add(head)
-            blockState.headAnchor = head
 
             // Whiteboard: 1.5m closer than before (was 1.2m, now 0.3m in front)
             Task { @MainActor in
@@ -255,10 +247,7 @@ struct ImmersiveView: View {
                     }
 
                     guard let planeAnchor = blockState.planeAnchor,
-                          let headAnchor = blockState.headAnchor,
                           let root = blockState.rootEntity else { return }
-
-                    let palmOpen = handTrackingManager.isPalmCurrentlyOpen()
 
                     if let deviceAnchor = handTrackingManager.queryDeviceAnchor() {
                         let t = deviceAnchor.originFromAnchorTransform
@@ -266,38 +255,31 @@ struct ImmersiveView: View {
                         let forward = SIMD3<Float>(t.columns.2.x, t.columns.2.y, t.columns.2.z)
                         let horizontalForward = simd_normalize(SIMD3<Float>(forward.x, 0, forward.z))
 
-                        if !blockState.hasInitialPlacement, simd_length(horizontalForward) > 0.1 {
-                            // Initial placement: snap to 2m in front on surface
+                        if simd_length(horizontalForward) > 0.1 {
                             let distanceInFront: Float = 2.0
                             let pointInFront = devicePos + horizontalForward * distanceInFront
                             let surfaceY = planeAnchor.position(relativeTo: nil).y
                             let hitWorld = SIMD3<Float>(pointInFront.x, surfaceY, pointInFront.z)
                             let localPos = planeAnchor.convert(position: hitWorld, from: nil)
                             let middleChildCenterOffset: Float = Self.targetBoundsSize / 2
-                            root.position = SIMD3<Float>(localPos.x, localPos.y - middleChildCenterOffset, localPos.z)
-                            blockState.hasInitialPlacement = true
-                        } else if blockState.isRepositioningMode {
-                            if palmOpen {
-                                // Palm open: head-locked, statically 2m in front
-                                if root.parent != headAnchor {
-                                    root.removeFromParent()
-                                    headAnchor.addChild(root)
+                            let snapPosition = SIMD3<Float>(localPos.x, localPos.y - middleChildCenterOffset, localPos.z)
+
+                            if !blockState.hasInitialPlacement {
+                                // Initial placement: snap to 2m in front on surface
+                                root.position = snapPosition
+                                blockState.hasInitialPlacement = true
+                            } else if blockState.isRepositioningMode {
+                                let palmOpen = handTrackingManager.isPalmCurrentlyOpen()
+                                if palmOpen, !blockState.wasPalmOpenForReposition {
+                                    // Palm just opened: snap to surface in front
+                                    root.position = snapPosition
                                 }
-                                root.position = [0, 0, -2.0]  // 2m in front of head, level
-                                blockState.wasPalmOpenInRepositioning = true
-                            } else if blockState.wasPalmOpenInRepositioning {
-                                // Palm just released: plop to surface under current position
-                                plopRootFromHeadToSurface()
-                                blockState.wasPalmOpenInRepositioning = false
+                                blockState.wasPalmOpenForReposition = palmOpen
                             }
                         }
                     } else {
                         // Simulator or no tracking
                         if let root = blockState.rootEntity, let planeAnchor = blockState.planeAnchor {
-                            if root.parent == blockState.headAnchor {
-                                root.removeFromParent()
-                                planeAnchor.addChild(root)
-                            }
                             root.position = [0, 0, -0.5 * Self.scaleFactor]
                             blockState.hasInitialPlacement = true
                         }
@@ -369,11 +351,7 @@ struct ImmersiveView: View {
         .onChange(of: appModel.repositioningMode) { _, newValue in
             blockState.isRepositioningMode = newValue
             handTrackingManager.isRepositioningMode = newValue
-            blockState.wasPalmOpenInRepositioning = false
-            // When exiting repositioning: plop root down to surface at current location
-            if !newValue {
-                plopRootToSurface()
-            }
+            blockState.wasPalmOpenForReposition = false
         }
         .onAppear {
             blockState.isRepositioningMode = appModel.repositioningMode
@@ -408,7 +386,6 @@ struct ImmersiveView: View {
             blockState.testingWebviewURLs = [:]
             blockState.webviewEntities = [:]
             blockState.planeAnchor = nil
-            blockState.headAnchor = nil
             blockState.whiteboardEntity = nil
             blockState.palmTreeEntity = nil
             blockState.isPalmTreeJumping = false
@@ -416,45 +393,9 @@ struct ImmersiveView: View {
             blockState.thinkingTemplate = nil
             blockState.computerDeskTemplate = nil
             blockState.hasInitialPlacement = false
-            blockState.wasPalmOpenInRepositioning = false
+            blockState.wasPalmOpenForReposition = false
             blockState.wsConnected = false
             blockState.lastWsMessage = ""
-        }
-    }
-
-    /// Snap root to surface at current XZ (root already under plane anchor).
-    private func plopRootToSurfaceAtCurrentXZ() {
-        guard let planeAnchor = blockState.planeAnchor,
-              let root = blockState.rootEntity else { return }
-        let rootWorldPos = root.position(relativeTo: nil)
-        let surfaceY = planeAnchor.position(relativeTo: nil).y
-        let hitWorld = SIMD3<Float>(rootWorldPos.x, surfaceY, rootWorldPos.z)
-        let localPos = planeAnchor.convert(position: hitWorld, from: nil)
-        let middleChildCenterOffset: Float = Self.targetBoundsSize / 2
-        root.position = SIMD3<Float>(localPos.x, localPos.y - middleChildCenterOffset, localPos.z)
-    }
-
-    /// Move root from head anchor to plane anchor, plop to surface at current XZ.
-    private func plopRootFromHeadToSurface() {
-        guard let planeAnchor = blockState.planeAnchor,
-              let root = blockState.rootEntity else { return }
-        let rootWorldPos = root.position(relativeTo: nil)
-        root.removeFromParent()
-        planeAnchor.addChild(root)
-        let surfaceY = planeAnchor.position(relativeTo: nil).y
-        let hitWorld = SIMD3<Float>(rootWorldPos.x, surfaceY, rootWorldPos.z)
-        let localPos = planeAnchor.convert(position: hitWorld, from: nil)
-        let middleChildCenterOffset: Float = Self.targetBoundsSize / 2
-        root.position = SIMD3<Float>(localPos.x, localPos.y - middleChildCenterOffset, localPos.z)
-    }
-
-    /// Snap root to surface (called when exiting repositioning mode via toggle).
-    private func plopRootToSurface() {
-        guard let root = blockState.rootEntity else { return }
-        if root.parent == blockState.headAnchor {
-            plopRootFromHeadToSurface()
-        } else {
-            plopRootToSurfaceAtCurrentXZ()
         }
     }
 
@@ -622,19 +563,17 @@ struct ImmersiveView: View {
 
     private func handleAgentStartTesting(agentId: Int, vercelLink: String, browserbaseLink: String) async {
         await MainActor.run {
-            let urlToShow = vercelLink.trimmingCharacters(in: .whitespacesAndNewlines)
-            let url = urlToShow.isEmpty ? "https://www.google.com" : urlToShow
+            guard blockState.agentStates[agentId] == .working,
+                  let character = blockState.characterEntities[agentId] else { return }
+            blockState.agentStates[agentId] = .testing
 
-            if let container = blockState.characterEntities[agentId] {
-                // Character exists: transition to testing (thinking or working → testing)
-                blockState.thinkingIndicatorEntities[agentId]?.removeFromParent()
-                blockState.thinkingIndicatorEntities.removeValue(forKey: agentId)
-                blockState.agentStates[agentId] = .testing
-                blockState.testingWebviewURLs[agentId] = url
-                applyTestingState(container: container, agentId: agentId)
-            } else {
-                // No character: spawn directly in testing state
-                spawnOrResetCharacter(agentId: agentId, targetState: .testing, vercelLink: url)
+            // Show webview: prefer Browserbase replay, else Vercel preview, else placeholder
+            let url = !browserbaseLink.isEmpty ? browserbaseLink : (!vercelLink.isEmpty ? vercelLink : "https://google.com")
+            blockState.testingWebviewURLs[agentId] = url
+            if let webviewEntity = blockState.webviewEntities[agentId] {
+                webviewEntity.removeFromParent()
+                webviewEntity.position = [0, 1.0, 1.0]  // 1m above character, 1m forward (Z)
+                character.addChild(webviewEntity)
             }
         }
     }
@@ -661,7 +600,7 @@ struct ImmersiveView: View {
         // Container: no rotation; handles position and jump. Webview/thinking indicator stay world-aligned.
         let container = Entity()
         container.name = "character_\(agentId)"
-        container.position = [gridPos.x, targetY - 1.0, gridPos.z - 1.0]
+        container.position = [gridPos.x, targetY - 1.0, gridPos.z - 2.5]  // 1.5m closer towards user (was -1.0)
         root.addChild(container)
         blockState.characterEntities[agentId] = container
         blockState.agentStates[agentId] = targetState
@@ -677,9 +616,10 @@ struct ImmersiveView: View {
         }
         charModel.name = "char_model_\(agentId)"
         charModel.position = [0, 0, 0]
-        let rotY = simd_quatf(angle: 70 * .pi / 180, axis: [0, 1, 0])
-        let rotX = simd_quatf(angle: 90 * .pi / 180, axis: [1, 0, 0])
-        charModel.orientation = rotY * rotX
+        let rotY = simd_quatf(angle: 90 * .pi / 180, axis: [0, 1, 0])
+        let rotZ = simd_quatf(angle: 180 * .pi / 180, axis: [0, 0, 1])
+        let rotZ90 = simd_quatf(angle: 90 * .pi / 180, axis: [0, 0, 1])  // 90° CCW on Z
+        charModel.orientation = rotY * rotZ * rotZ90
         container.addChild(charModel)
 
         if targetState == .thinking {
@@ -703,7 +643,7 @@ struct ImmersiveView: View {
         }
 
         var targetTransform = container.transform
-        targetTransform.translation = [gridPos.x, targetY, gridPos.z - 1.0]
+        targetTransform.translation = [gridPos.x, targetY, gridPos.z - 2.5]  // 1.5m closer towards user
         container.move(to: targetTransform, relativeTo: root, duration: 0.6, timingFunction: .easeOut)
     }
 

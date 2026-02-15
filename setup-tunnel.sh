@@ -25,18 +25,32 @@ fi
 # Ensure config dir exists
 mkdir -p "$CONFIG_DIR"
 
-# Login (opens browser)
-echo "Ensuring Cloudflare login..."
-cloudflared tunnel login
-
-# Create tunnel if it doesn't exist
-if ! cloudflared tunnel list 2>/dev/null | grep -q "$TUNNEL_NAME"; then
-  echo "Creating tunnel: $TUNNEL_NAME"
-  cloudflared tunnel create "$TUNNEL_NAME"
+# Login only if no account cert (use your existing cert.pem if present)
+if [[ ! -f "${CONFIG_DIR}/cert.pem" ]]; then
+  echo "Ensuring Cloudflare login..."
+  cloudflared tunnel login
+else
+  echo "Using existing cert at ${CONFIG_DIR}/cert.pem"
 fi
 
-# Get tunnel ID (first column of tunnel list output)
+# Get tunnel ID if it exists
 TUNNEL_ID=$(cloudflared tunnel list 2>/dev/null | grep "$TUNNEL_NAME" | awk '{print $1}' | head -1)
+CREDENTIALS_FILE="${CONFIG_DIR}/${TUNNEL_ID}.json"
+
+# If tunnel exists but credentials JSON is missing, delete the orphan tunnel so we can create a new one
+if [[ -n "$TUNNEL_ID" ]] && [[ ! -f "$CREDENTIALS_FILE" ]]; then
+  echo "Tunnel $TUNNEL_NAME exists but credentials file is missing. Deleting orphan tunnel..."
+  cloudflared tunnel delete "$TUNNEL_NAME" 2>/dev/null || true
+  TUNNEL_ID=""
+fi
+
+# Create tunnel if it doesn't exist (or we just deleted an orphan)
+if [[ -z "$TUNNEL_ID" ]]; then
+  echo "Creating tunnel: $TUNNEL_NAME"
+  cloudflared tunnel create "$TUNNEL_NAME"
+  TUNNEL_ID=$(cloudflared tunnel list 2>/dev/null | grep "$TUNNEL_NAME" | awk '{print $1}' | head -1)
+fi
+
 if [[ -z "$TUNNEL_ID" ]]; then
   echo "Could not find tunnel ID for $TUNNEL_NAME. Run: cloudflared tunnel list"
   exit 1
@@ -60,9 +74,12 @@ ingress:
   - service: http_status:404
 EOF
 
-# Route DNS
+# Route DNS (create or update CNAME to this tunnel)
 echo "Routing DNS: ${SUBDOMAIN}.${DOMAIN} -> tunnel"
-cloudflared tunnel route dns "$TUNNEL_NAME" "${SUBDOMAIN}.${DOMAIN}"
+if ! cloudflared tunnel route dns "$TUNNEL_NAME" "${SUBDOMAIN}.${DOMAIN}" 2>/dev/null; then
+  echo "Note: DNS record already exists. Point ${SUBDOMAIN}.${DOMAIN} CNAME to: ${TUNNEL_ID}.cfargotunnel.com"
+  echo "      Cloudflare Dashboard -> tzhu.dev -> DNS -> edit treehacks CNAME target to the above."
+fi
 
 echo ""
 echo "Tunnel configured. Start your backend (e.g. docker compose up) on port $LOCAL_PORT, then run:"
