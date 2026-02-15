@@ -15,6 +15,8 @@ final class DemoBlockState {
     /// Child cubes in a grid; these are the ones that cycle color.
     var childEntities: [ModelEntity] = []
     var planeAnchor: AnchorEntity?
+    /// When true, root follows gaze (where user is looking) instead of hand.
+    var isRepositioningMode = false
 }
 
 struct ImmersiveView: View {
@@ -26,7 +28,6 @@ struct ImmersiveView: View {
     @State private var wsTask: URLSessionWebSocketTask?
     @State private var setupTask: Task<Void, Never>?
     @State private var spawnTask: Task<Void, Never>?
-    @State private var repositioningMode = false
 
     private static let maxAgents = 9
     private static let gridCols = 3
@@ -68,6 +69,32 @@ struct ImmersiveView: View {
             blockState.rootEntity = root
             blockState.childEntities = []
             blockState.planeAnchor = anchor
+
+            // Gaze-based repositioning: project surface where user is looking
+            _ = content.subscribe(to: SceneEvents.Update.self) { _ in
+                guard blockState.isRepositioningMode,
+                      let root = blockState.rootEntity,
+                      let planeAnchor = blockState.planeAnchor,
+                      let deviceAnchor = handTrackingManager.queryDeviceAnchor() else { return }
+
+                let t = deviceAnchor.originFromAnchorTransform
+                let devicePos = SIMD3<Float>(t.columns.3.x, t.columns.3.y, t.columns.3.z)
+                // Forward = -Z in camera space
+                let forward = SIMD3<Float>(-t.columns.2.x, -t.columns.2.y, -t.columns.2.z)
+                let forwardNorm = simd_normalize(forward)
+
+                // Project gaze ray onto horizontal surface ~0.5m below head (table height)
+                let surfaceY = devicePos.y - 0.5
+                let planeNormal = SIMD3<Float>(0, 1, 0)
+                let denom = simd_dot(forwardNorm, planeNormal)
+                guard abs(denom) > 0.01 else { return } // avoid parallel
+                let tHit = (surfaceY - devicePos.y) / denom
+                guard tHit > 0.1, tHit < 5.0 else { return } // 0.1m–5m in front
+                let hitWorld = devicePos + forwardNorm * tHit
+
+                let localPos = planeAnchor.convert(position: hitWorld, from: nil)
+                root.position = SIMD3<Float>(localPos.x, 0.2, localPos.z)
+            }
         } update: { _ in
             let newMaterial = SimpleMaterial(color: boxColor, isMetallic: false)
             for entity in blockState.childEntities {
@@ -76,31 +103,13 @@ struct ImmersiveView: View {
                 entity.components[ModelComponent.self] = modelComponent
             }
         }
-        .overlay(alignment: .topLeading) {
-            HStack(spacing: 12) {
-                Button {
-                    Task { @MainActor in
-                        appModel.immersiveSpaceState = .inTransition
-                        await dismissImmersiveSpace()
-                    }
-                } label: {
-                    Label("Exit", systemImage: "xmark.circle.fill")
-                }
-                .buttonStyle(.borderedProminent)
-
-                Button {
-                    repositioningMode.toggle()
-                    handTrackingManager.isRepositioningMode = repositioningMode
-                } label: {
-                    Label(repositioningMode ? "Done" : "Reposition", systemImage: repositioningMode ? "checkmark.circle.fill" : "hand.draw.fill")
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(repositioningMode ? .green : .blue)
-            }
-            .padding(24)
-            .glassBackgroundEffect()
+        .onChange(of: appModel.repositioningMode) { _, newValue in
+            blockState.isRepositioningMode = newValue
+            handTrackingManager.isRepositioningMode = newValue
         }
         .onAppear {
+            blockState.isRepositioningMode = appModel.repositioningMode
+            handTrackingManager.isRepositioningMode = appModel.repositioningMode
             startWebSocket()
             startSpawnLoop()
             // Defer hand tracking so the box renders first (ARKit session can delay initial render)
@@ -214,23 +223,8 @@ struct ImmersiveView: View {
             await triggerRecordOnce()
         }
 
-        handTrackingManager.onOpenPalmForDrag = { handAnchor in
-            guard let root = blockState.rootEntity,
-                  let planeAnchor = blockState.planeAnchor else { return }
-
-            // Get hand position in world space from HandAnchor
-            let t = handAnchor.originFromAnchorTransform
-            let handWorldPos = SIMD3<Float>(t.columns.3.x, t.columns.3.y, t.columns.3.z)
-
-            // Project hand XY straight down to the surface: use hand's X and Z, surface's Y
-            let planeWorldPos = planeAnchor.position(relativeTo: nil)
-            let surfaceY = planeWorldPos.y
-            let projectedWorldPos = SIMD3<Float>(handWorldPos.x, surfaceY, handWorldPos.z)
-
-            // Convert to plane anchor's local space and set root position
-            let localPos = planeAnchor.convert(position: projectedWorldPos, from: nil)
-            root.position = SIMD3<Float>(localPos.x, 0.2, localPos.z)
-        }
+        // Repositioning is now gaze-based (see SceneEvents.Update subscription)
+        handTrackingManager.onOpenPalmForDrag = { _ in }
 
         Task {
             await handTrackingManager.startTracking()

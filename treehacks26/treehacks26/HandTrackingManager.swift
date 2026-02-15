@@ -12,6 +12,7 @@ final class HandTrackingManager {
     /// Create fresh instances each time - ARKitSession cannot be restarted after stop()
     private var arSession = ARKitSession()
     private var handTracking = HandTrackingProvider()
+    private var worldTracking = WorldTrackingProvider()
     private var processTask: Task<Void, Never>?
 
     private(set) var isTracking = false
@@ -37,6 +38,12 @@ final class HandTrackingManager {
     /// Called every frame when open palm in repositioning mode - receives HandAnchor for chirality
     var onOpenPalmForDrag: ((HandAnchor) -> Void)?
 
+    /// Device anchor for gaze-based positioning (WorldTrackingProvider must be running).
+    func queryDeviceAnchor() -> DeviceAnchor? {
+        guard worldTracking.state == .running else { return nil }
+        return worldTracking.queryDeviceAnchor(atTimestamp: CACurrentMediaTime())
+    }
+
     func startTracking() async {
         guard HandTrackingProvider.isSupported else {
             print("[HandTracking] Hand tracking not supported on this device")
@@ -44,7 +51,7 @@ final class HandTrackingManager {
         }
 
         do {
-            try await arSession.run([handTracking])
+            try await arSession.run([handTracking, worldTracking])
             isTracking = true
             print("[HandTracking] Started hand tracking")
 
@@ -62,6 +69,7 @@ final class HandTrackingManager {
         // Create fresh instances for next start - ARKitSession cannot be restarted after stop()
         arSession = ARKitSession()
         handTracking = HandTrackingProvider()
+        worldTracking = WorldTrackingProvider()
         print("[HandTracking] Stopped hand tracking")
     }
 
