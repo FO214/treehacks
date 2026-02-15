@@ -19,6 +19,9 @@ class AppModel {
     }
     var immersiveSpaceState = ImmersiveSpaceState.closed
 
+    /// When true, open palm drags the cube instead of triggering record-once
+    var repositioningMode = false
+
     /// Number of agents; should match number of tables (start 1, +1 per new agent)
     var agentCount: Int = 1
 

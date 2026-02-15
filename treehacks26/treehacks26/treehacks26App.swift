@@ -9,10 +9,10 @@ import SwiftUI
 
 @main
 struct treehacks26App: App {
-    
+    @Environment(\.scenePhase) private var scenePhase
     @State private var appModel = AppModel()
     @State private var avPlayerViewModel = AVPlayerViewModel()
-    
+
     var body: some Scene {
         WindowGroup {
             if avPlayerViewModel.isPlaying {
@@ -20,6 +20,11 @@ struct treehacks26App: App {
             } else {
                 ContentView()
                     .environment(appModel)
+            }
+        }
+        .onChange(of: scenePhase) { _, newPhase in
+            if newPhase == .background {
+                exit(0)
             }
         }
         

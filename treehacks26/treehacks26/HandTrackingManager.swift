@@ -9,8 +9,11 @@ import SwiftUI
 @Observable
 @MainActor
 final class HandTrackingManager {
+    /// Create fresh instances each time - ARKitSession cannot be restarted after stop()
     private var arSession = ARKitSession()
     private var handTracking = HandTrackingProvider()
+    private var worldTracking = WorldTrackingProvider()
+    private var processTask: Task<Void, Never>?
 
     private(set) var isTracking = false
     private(set) var lastGestureTime: Date?
@@ -19,8 +22,27 @@ final class HandTrackingManager {
     /// Minimum seconds between gesture triggers (debounce)
     private let gestureCooldown: TimeInterval = 2.0
 
-    /// Endpoint to call when open palm is detected
+    /// Set to true to log per-finger debug info to console
+    var debugEnabled = true
+
+    /// Throttle debug logs (seconds between logs)
+    private var lastDebugLogTime: Date?
+    private let debugLogInterval: TimeInterval = 1.5
+
+    /// When true, open palm triggers drag callback instead of trigger callback
+    var isRepositioningMode = false
+
+    /// Called when open palm detected (normal mode) - debounced
     var onOpenPalmDetected: (() async -> Void)?
+
+    /// Called every frame when open palm in repositioning mode - receives HandAnchor for chirality
+    var onOpenPalmForDrag: ((HandAnchor) -> Void)?
+
+    /// Device anchor for gaze-based positioning (WorldTrackingProvider must be running).
+    func queryDeviceAnchor() -> DeviceAnchor? {
+        guard worldTracking.state == .running else { return nil }
+        return worldTracking.queryDeviceAnchor(atTimestamp: CACurrentMediaTime())
+    }
 
     func startTracking() async {
         guard HandTrackingProvider.isSupported else {
@@ -29,51 +51,104 @@ final class HandTrackingManager {
         }
 
         do {
-            try await arSession.run([handTracking])
+            try await arSession.run([handTracking, worldTracking])
             isTracking = true
             print("[HandTracking] Started hand tracking")
 
-            await processHandUpdates()
+            processTask = Task { await processHandUpdates(handTracking) }
         } catch {
             print("[HandTracking] Failed to start: \(error)")
         }
     }
 
     func stopTracking() {
+        processTask?.cancel()
+        processTask = nil
         arSession.stop()
         isTracking = false
+        // Create fresh instances for next start - ARKitSession cannot be restarted after stop()
+        arSession = ARKitSession()
+        handTracking = HandTrackingProvider()
+        worldTracking = WorldTrackingProvider()
         print("[HandTracking] Stopped hand tracking")
     }
 
-    private func processHandUpdates() async {
-        for await update in handTracking.anchorUpdates {
-            guard update.event == .updated else { continue }
+    private func processHandUpdates(_ provider: HandTrackingProvider) async {
+        var updateCount = 0
+        var notTrackedCount = 0
+        var trackedCount = 0
+
+        for await update in provider.anchorUpdates {
+            guard !Task.isCancelled else { return }
+            if update.event != .updated && update.event != .added { continue }
+            if debugEnabled, update.event == .added, shouldLogDebug() {
+                print("[HandTracking] Hand anchor added")
+            }
 
             let anchor = update.anchor
-            guard anchor.isTracked else { continue }
+            updateCount += 1
+
+            if !anchor.isTracked {
+                notTrackedCount += 1
+                if debugEnabled, shouldLogDebug() {
+                    print("[HandTracking] Hand not tracked (total: \(updateCount), tracked: \(trackedCount), notTracked: \(notTrackedCount))")
+                }
+                continue
+            }
+
+            trackedCount += 1
+            if trackedCount == 1, debugEnabled {
+                print("[HandTracking] First tracked hand received")
+            }
 
             // Check for open palm gesture
-            if isOpenPalm(anchor: anchor) {
+            guard isOpenPalm(anchor: anchor) else { continue }
+
+            if isRepositioningMode {
+                onOpenPalmForDrag?(anchor)
+            } else {
                 await handleOpenPalmDetected()
             }
         }
     }
 
+    private func shouldLogDebug() -> Bool {
+        let now = Date()
+        guard let last = lastDebugLogTime else {
+            lastDebugLogTime = now
+            return true
+        }
+        if now.timeIntervalSince(last) >= debugLogInterval {
+            lastDebugLogTime = now
+            return true
+        }
+        return false
+    }
+
     private func isOpenPalm(anchor: HandAnchor) -> Bool {
         let skeleton = anchor.handSkeleton
-        guard let skeleton = skeleton else { return false }
+        guard let skeleton = skeleton else {
+            if debugEnabled, shouldLogDebug() { print("[HandTracking] No hand skeleton") }
+            return false
+        }
 
-        // Check if all fingers are extended
-        let fingersExtended = [
-            isFingerExtended(skeleton: skeleton, finger: .index),
-            isFingerExtended(skeleton: skeleton, finger: .middle),
-            isFingerExtended(skeleton: skeleton, finger: .ring),
-            isFingerExtended(skeleton: skeleton, finger: .little),
-            isThumbExtended(skeleton: skeleton)
-        ]
+        let (indexExt, indexDot) = fingerExtendedWithDot(skeleton: skeleton, finger: .index)
+        let (middleExt, middleDot) = fingerExtendedWithDot(skeleton: skeleton, finger: .middle)
+        let (ringExt, ringDot) = fingerExtendedWithDot(skeleton: skeleton, finger: .ring)
+        let (littleExt, littleDot) = fingerExtendedWithDot(skeleton: skeleton, finger: .little)
+        let thumbExt = isThumbExtended(skeleton: skeleton)
 
-        // All 5 fingers must be extended for open palm
-        return fingersExtended.allSatisfy { $0 }
+        let fingersExtended = [indexExt, middleExt, ringExt, littleExt, thumbExt]
+        let allExtended = fingersExtended.allSatisfy { $0 }
+
+        if debugEnabled, shouldLogDebug() {
+            let failed = ["index", "middle", "ring", "little", "thumb"].enumerated()
+                .filter { !fingersExtended[$0.offset] }
+                .map(\.element)
+            print("[HandTracking] Palm: idx=\(String(format: "%.2f", indexDot)) mid=\(String(format: "%.2f", middleDot)) ring=\(String(format: "%.2f", ringDot)) little=\(String(format: "%.2f", littleDot)) thumb=\(thumbExt) → \(allExtended ? "OPEN" : "closed (\(failed))")")
+        }
+
+        return allExtended
     }
 
     private enum Finger {
@@ -81,6 +156,12 @@ final class HandTrackingManager {
     }
 
     private func isFingerExtended(skeleton: HandSkeleton, finger: Finger) -> Bool {
+        let (extended, dot) = fingerExtendedWithDot(skeleton: skeleton, finger: finger)
+        return extended
+    }
+
+    /// Returns (isExtended, dotProduct). Dot > 0.7 = straight finger.
+    private func fingerExtendedWithDot(skeleton: HandSkeleton, finger: Finger) -> (Bool, Float) {
         let (knuckle, intermediate, tip): (HandSkeleton.JointName, HandSkeleton.JointName, HandSkeleton.JointName)
 
         switch finger {
@@ -102,18 +183,14 @@ final class HandTrackingManager {
             tip = .littleFingerTip
         }
 
-        guard let knuckleJoint = skeleton.joint(knuckle),
-              let intermediateJoint = skeleton.joint(intermediate),
-              let tipJoint = skeleton.joint(tip) else {
-            return false
-        }
+        let knuckleJoint = skeleton.joint(knuckle)
+        let intermediateJoint = skeleton.joint(intermediate)
+        let tipJoint = skeleton.joint(tip)
 
-        // Get positions
         let knucklePos = knuckleJoint.anchorFromJointTransform.columns.3
         let intermediatePos = intermediateJoint.anchorFromJointTransform.columns.3
         let tipPos = tipJoint.anchorFromJointTransform.columns.3
 
-        // Calculate vectors
         let vec1 = SIMD3<Float>(intermediatePos.x - knucklePos.x,
                                  intermediatePos.y - knucklePos.y,
                                  intermediatePos.z - knucklePos.z)
@@ -121,20 +198,14 @@ final class HandTrackingManager {
                                  tipPos.y - intermediatePos.y,
                                  tipPos.z - intermediatePos.z)
 
-        // Calculate angle between segments
         let dot = simd_dot(simd_normalize(vec1), simd_normalize(vec2))
-
-        // If dot product is close to 1, finger is straight (extended)
-        // Threshold of 0.7 allows for some natural bend
-        return dot > 0.7
+        return (dot > 0.7, dot)
     }
 
     private func isThumbExtended(skeleton: HandSkeleton) -> Bool {
-        guard let knuckleJoint = skeleton.joint(.thumbKnuckle),
-              let tipJoint = skeleton.joint(.thumbTip),
-              let wristJoint = skeleton.joint(.wrist) else {
-            return false
-        }
+        let knuckleJoint = skeleton.joint(.thumbKnuckle)
+        let tipJoint = skeleton.joint(.thumbTip)
+        let wristJoint = skeleton.joint(.wrist)
 
         // For thumb, check if tip is far enough from wrist
         let tipPos = tipJoint.anchorFromJointTransform.columns.3
