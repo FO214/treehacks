@@ -30,7 +30,7 @@ PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 mcp = FastMCP("TreeHacks Fix Agent")
 
 # Default repository for testing
-DEFAULT_REPO_URL = "https://github.com/iankorovinsky/treehacks-agent-repo"
+DEFAULT_REPO_URL = "https://github.com/soooooooot/treehacks-agent-repo"
 
 # System prompt: frames the task for fix/change flows (make the modification only,
 # the server handles branching/committing/PR automatically).
