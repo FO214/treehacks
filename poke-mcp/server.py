@@ -38,6 +38,37 @@ DEFAULT_REPO_URL = "https://github.com/soooooooot/treehacks-agent-repo"
 # before the long-running job finishes.
 RUN_FIX_IN_BACKGROUND = (os.environ.get("RUN_FIX_IN_BACKGROUND", "").strip().lower() in ("1", "true", "yes"))
 
+# ---------------------------------------------------------------------------
+# Event webhook: POST agent progress events to FastAPI /internal/event
+# ---------------------------------------------------------------------------
+EVENT_WEBHOOK_URL = os.environ.get("EVENT_WEBHOOK_URL", "http://localhost:8000/internal/event")
+
+# Atomic agent ID counter (1-9, wrapping)
+_agent_id_counter = 0
+_agent_id_lock = threading.Lock()
+
+
+def _next_agent_id() -> int:
+    """Return the next agent ID (1-9, wrapping)."""
+    global _agent_id_counter
+    with _agent_id_lock:
+        _agent_id_counter = (_agent_id_counter % 9) + 1
+        return _agent_id_counter
+
+
+def _post_event(event: dict) -> None:
+    """Fire-and-forget POST to the FastAPI event webhook."""
+    payload = json.dumps(event).encode()
+    headers = {"Content-Type": "application/json"}
+    try:
+        req = urllib.request.Request(
+            EVENT_WEBHOOK_URL, data=payload, method="POST", headers=headers,
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            resp.read()
+    except Exception as e:
+        print(f"[soot] event webhook failed: {e}", flush=True)
+
 # System prompt: frames the task for fix/change flows (make the modification only,
 # the server handles branching/committing/PR automatically).
 FIX_SYSTEM_PROMPT = """You are a code assistant working in a cloned repository at /repo. Your task is to:
@@ -521,10 +552,13 @@ def run_modal_agent(
     app = modal.App.lookup("treehacks-fix-agent", create_if_missing=True)
     sandbox_image = _get_sandbox_image()
 
+    agent_id = _next_agent_id()
+
     sb = None
     try:
         # ── Create sandbox ────────────────────────────────────────────
         print("[soot] Creating Modal sandbox...", flush=True)
+        _post_event({"type": "create_agent_thinking", "agent_id": agent_id, "task_name": instruction[:100]})
         sandbox_kwargs: dict = dict(app=app, image=sandbox_image, timeout=10 * 60)
         with modal.enable_output():
             sb = modal.Sandbox.create(**sandbox_kwargs)
@@ -565,6 +599,7 @@ def run_modal_agent(
             )
 
         print("[soot] Running claude-agent-sdk...", flush=True)
+        _post_event({"type": "agent_start_working", "agent_id": agent_id})
         agent_p = sb.exec(
             "python", "-c", AGENT_SCRIPT,
             workdir="/repo",
@@ -635,6 +670,8 @@ def run_modal_agent(
 
         # ── 7. (Optional) Smoke test via Browserbase + Vercel preview ──
         smoke_result = ""
+        vercel_url = ""
+        browserbase_url = ""
         if smoke_test:
             try:
                 # Wait for Vercel bot to comment with the preview URL
@@ -642,6 +679,7 @@ def run_modal_agent(
                 preview_url = _wait_for_vercel_preview(
                     owner, repo_name, pr_number, github_token, timeout=300,
                 )
+                vercel_url = preview_url or ""
 
                 if preview_url:
                     print(f"[soot] Running Browserbase smoke test against {preview_url}...", flush=True)
@@ -660,6 +698,11 @@ def run_modal_agent(
                             instruction=instruction,
                         ).result()
                     print(f"[soot] {smoke_result}", flush=True)
+
+                    # Extract Browserbase replay URL from smoke result
+                    bb_match = re.search(r"https://browserbase\.com/sessions/[a-zA-Z0-9\-]+", smoke_result)
+                    if bb_match:
+                        browserbase_url = bb_match.group(0)
                 else:
                     smoke_result = "Smoke test skipped: Vercel preview deploy did not complete within 5 minutes."
                     print(f"[soot] {smoke_result}", flush=True)
@@ -667,6 +710,14 @@ def run_modal_agent(
             except Exception as e:
                 smoke_result = f"Smoke test error: {e}"
                 print(f"[soot] {smoke_result}", flush=True)
+
+        # ── Emit agent_start_testing with URLs (final event for frontend) ──
+        _post_event({
+            "type": "agent_start_testing",
+            "agent_id": agent_id,
+            "vercel_link": vercel_url,
+            "browserbase_link": browserbase_url,
+        })
 
         result_parts = [f"PR created: {pr_url}", f"Branch: {branch_name}"]
         if smoke_result:
@@ -676,6 +727,7 @@ def run_modal_agent(
         return "\n".join(result_parts)
 
     except Exception as e:
+        _post_event({"type": "agent_error", "agent_id": agent_id, "error_message": str(e)})
         return f"Error: {str(e)}"
 
     finally:

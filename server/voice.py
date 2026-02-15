@@ -122,6 +122,10 @@ _stop_requested = False
 _poll_thread: threading.Thread | None = None
 _tts_loop_task: asyncio.Task | None = None
 
+# Explicit start/stop recording state (for WS hand_open / hand_close flow)
+_recording_process: subprocess.Popen | None = None
+_recording_audio_path: str | None = None
+
 
 def _sqlite_int(val) -> str:
     s = str(val or "0").strip()
@@ -603,3 +607,152 @@ def voice_startup() -> None:
     start_chat_poller()
     if TALKBACK_ENABLED and TTS_LOOP_AUTOSTART:
         pass  # TTS loop started in lifespan
+
+
+# ---------------------------------------------------------------------------
+# Explicit start / stop recording (WebSocket hand_open / hand_close flow)
+# ---------------------------------------------------------------------------
+
+def start_recording() -> None:
+    """
+    Begin recording from the mic (SoX) without silence detection.
+    Returns immediately; the process runs in the background until
+    stop_recording() is called.
+    """
+    global _recording_process, _recording_audio_path
+
+    # If already recording, ignore
+    if _recording_process is not None:
+        print("[voice] start_recording: already recording, ignoring")
+        return
+
+    if not RECORD_BIN:
+        print("[voice] start_recording: no recorder (install SoX)")
+        return
+
+    _recording_audio_path = _temp_audio_path("voice-ws", "wav")
+    _play_notification_sound(START_RECORDING_SOUND)
+
+    # Record continuously (no silence detection) — mono 16-bit WAV
+    args: list[str] = []
+    if RECORD_SAMPLE_RATE:
+        args += ["-r", RECORD_SAMPLE_RATE]
+    args += ["-q", "-c", "1", "-b", "16", _recording_audio_path]
+
+    if RECORD_BIN == "rec":
+        cmd = ["rec"] + args
+    else:
+        cmd = ["sox", "-d"] + args
+
+    print(f"[voice] start_recording: {' '.join(cmd)}")
+    _recording_process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=os.environ,
+    )
+
+
+def stop_recording() -> str | None:
+    """
+    Stop the recording started by start_recording().
+    Returns the path to the recorded WAV file, or None if nothing was recording.
+    """
+    global _recording_process, _recording_audio_path
+
+    if _recording_process is None:
+        print("[voice] stop_recording: not recording")
+        return None
+
+    # Send SIGINT so SoX finalises the WAV header properly
+    import signal
+    try:
+        _recording_process.send_signal(signal.SIGINT)
+        _recording_process.wait(timeout=5)
+    except Exception:
+        _recording_process.kill()
+        _recording_process.wait(timeout=3)
+
+    _play_notification_sound(STOP_RECORDING_SOUND)
+
+    audio_path = _recording_audio_path
+    _recording_process = None
+    _recording_audio_path = None
+
+    print(f"[voice] stop_recording: saved to {audio_path}")
+    return audio_path
+
+
+async def stop_and_process(
+    on_event=None,
+    send_to_poke: bool = True,
+    talkback: bool = True,
+    await_inbound: bool = True,
+    timeout_ms: int | None = None,
+) -> dict:
+    """
+    Stop recording, transcribe, send to Poke, wait for response, speak it.
+
+    *on_event* is an async callable that receives event dicts to broadcast
+    over the WebSocket (e.g. poke_speaking_start / poke_speaking_stop).
+    """
+    global _is_busy, _latest_transcript
+    timeout_ms = timeout_ms or RESPONSE_TIMEOUT_MS
+
+    audio_path = stop_recording()
+    if audio_path is None:
+        return {"ok": False, "reason": "not_recording"}
+
+    _is_busy = True
+    try:
+        # Check audio size
+        size = Path(audio_path).stat().st_size if Path(audio_path).exists() else 0
+        if size < MIN_AUDIO_BYTES:
+            _play_notification_sound(NO_RECORDING_SOUND)
+            return {"ok": False, "reason": "audio_too_short"}
+
+        # Transcribe
+        transcript = await asyncio.to_thread(_transcribe_audio, audio_path)
+        _latest_transcript = transcript
+        if not transcript:
+            _play_notification_sound(NO_RECORDING_SOUND)
+            return {"ok": False, "reason": "empty_transcript"}
+
+        print(f"[you] {transcript}")
+
+        poke_ack = None
+        inbound = None
+
+        if send_to_poke:
+            print("[voice] Sending to Poke...")
+            poke_ack = await _poke_send_message(transcript)
+            print(f"[poke:ack] {json.dumps(poke_ack)}")
+            _log_poke_response(poke_ack)
+
+            if await_inbound and POKE_HANDLE_ID:
+                inbound = await _wait_for_inbound(timeout_ms)
+                inbound_text = (inbound or {}).get("text", "")
+                print(f"[poke:inbound] {json.dumps(inbound)}")
+
+                if talkback and TALKBACK_ENABLED and inbound_text:
+                    # Emit poke_speaking_start
+                    if on_event:
+                        await on_event({"type": "poke_speaking_start", "text": inbound_text})
+
+                    print(f"[voice] Speaking: {inbound_text}")
+                    await asyncio.to_thread(_speak_text, inbound_text)
+
+                    # Emit poke_speaking_stop
+                    if on_event:
+                        await on_event({"type": "poke_speaking_stop"})
+
+        return {"ok": True, "transcript": transcript, "pokeAck": poke_ack, "inbound": inbound}
+
+    except Exception as e:
+        _play_notification_sound(NO_RECORDING_SOUND)
+        print(f"[voice] stop_and_process error: {e}")
+        raise
+    finally:
+        if audio_path and Path(audio_path).exists():
+            Path(audio_path).unlink(missing_ok=True)
+        _is_busy = False
