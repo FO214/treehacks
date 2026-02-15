@@ -6,33 +6,42 @@
 import SwiftUI
 import RealityKit
 import ARKit
+import RealityKitContent
 
-/// Holds the root anchor entity (invisible), child cube entities, and plane anchor.
+/// Holds the root anchor entity (invisible), static desks, spawning characters, plane anchor, whiteboard, and cached templates.
 @Observable
 final class DemoBlockState {
     /// Invisible root entity anchored to surface; children are positioned relative to this.
     var rootEntity: Entity?
-    /// Child cubes in a grid; these are the ones that cycle color.
-    var childEntities: [ModelEntity] = []
+    /// Character entities only (spawn/despawn); desks are static.
+    var characterEntities: [Entity] = []
     var planeAnchor: AnchorEntity?
+    var whiteboardEntity: Entity?
+    /// Cached complete.usdz (characters); cloned when spawning.
+    var completeTemplate: Entity?
+    /// Cached computerSpawn.usdz (computer on desk); used for static desks.
+    var computerSpawnTemplate: Entity?
     /// When true, root follows gaze (where user is looking) instead of hand.
     var isRepositioningMode = false
+    /// True after we've placed root near user; avoids spawn at plane anchor center (often far away).
+    var hasInitialPlacement = false
 }
 
 struct ImmersiveView: View {
     @Environment(AppModel.self) private var appModel
     @Environment(\.dismissImmersiveSpace) private var dismissImmersiveSpace
-    @State private var boxColor: UIColor = .systemRed
     @State private var blockState = DemoBlockState()
     @State private var handTrackingManager = HandTrackingManager()
-    @State private var wsTask: URLSessionWebSocketTask?
     @State private var setupTask: Task<Void, Never>?
     @State private var spawnTask: Task<Void, Never>?
 
     private static let maxAgents = 9
     private static let gridCols = 3
-    private static let cubeSize: Float = 0.06
-    private static let gridSpacing: Float = 0.08
+    /// Target bounding box size for grid objects (desks/robots).
+    private static let targetBoundsSize: Float = 0.06
+    /// Larger size for desk/table models (Office_Props_Pack).
+    private static let deskTargetSize: Float = 0.15
+    private static let gridSpacing: Float = 0.12
 
     /// 3×3 grid positions (floor of root), row-major order.
     private static var gridPositions: [SIMD3<Float>] {
@@ -42,7 +51,7 @@ struct ImmersiveView: View {
             for col in 0..<gridCols {
                 positions.append([
                     Float(col) * gridSpacing - half,
-                    cubeSize / 2, // sit on floor
+                    targetBoundsSize / 2, // sit on floor
                     Float(row) * gridSpacing - half
                 ])
             }
@@ -51,57 +60,99 @@ struct ImmersiveView: View {
     }
 
     var body: some View {
-        // IMPORTANT: Initial closure must NOT capture boxColor. If it does, SwiftUI may
-        // recreate the entire RealityView when boxColor changes, causing the box to disappear briefly.
         RealityView { content in
-            // Root entity: invisible anchor for children, sits on surface (no mesh)
+            // Root entity: invisible anchor for children, sits on surface
             let root = Entity()
             root.name = "demoRoot"
             root.position = [0, 0.2, 0]
 
+            // Black floor under the root (horizontal XZ plane)
+            let floorMesh = MeshResource.generatePlane(width: 0.5, height: 0.5)
+            var floorMat = SimpleMaterial()
+            floorMat.color = .init(tint: .black)
+            let floorEntity = ModelEntity(mesh: floorMesh, materials: [floorMat])
+            floorEntity.name = "floor"
+            floorEntity.orientation = simd_quatf(angle: -.pi / 2, axis: [1, 0, 0])  // horizontal
+            floorEntity.position = [0, 0, 0]
+            root.addChild(floorEntity)
+
             // Children are spawned one per second by spawnTask (max 9, then reset)
 
             // Plane anchor: snaps to nearest horizontal surface (table, floor, etc.)
-            let anchor = AnchorEntity(.plane(.horizontal, classification: .any, minimumBounds: [0.4, 0.4]))
+            let anchor = AnchorEntity(.plane(.horizontal, classification: .table, minimumBounds: [0.4, 0.4]))
             anchor.addChild(root)
             content.add(anchor)
 
+            // Whiteboard: farther from user (1.2m in front), loaded from usdz
+            Task { @MainActor in
+                if let whiteboard = try? await Entity(named: "fixed_whiteboard.usdc", in: realityKitContentBundle) {
+                    whiteboard.name = "whiteboard"
+                    whiteboard.position = [0, 0.5, -1.2]  // 1.2m in front of origin
+                    anchor.addChild(whiteboard)
+                    Self.scaleToBoundsSize(whiteboard, targetSize: Self.targetBoundsSize * 5)
+                    blockState.whiteboardEntity = whiteboard
+                }
+            }
+
             blockState.rootEntity = root
-            blockState.childEntities = []
+            blockState.characterEntities = []
             blockState.planeAnchor = anchor
 
-            // Gaze-based repositioning: project surface where user is looking
+            // Load templates and create 9 static desks (computer on desk)
+            Task { @MainActor in
+                if let complete = try? await Entity(named: "complete.usdz", in: realityKitContentBundle) {
+                    blockState.completeTemplate = complete
+                }
+                if let computer = try? await Entity(named: "computerSpawn.usdz", in: realityKitContentBundle),
+                   let root = blockState.rootEntity {
+                    // Create 9 static desks at grid positions (never removed)
+                    for i in 0..<Self.maxAgents {
+                        let desk = computer.clone(recursive: true)
+                        desk.name = "desk_\(i)"
+                        let gridPos = Self.gridPositions[i]
+                        desk.position = [gridPos.x, Self.targetBoundsSize / 2, gridPos.z]
+                        root.addChild(desk)
+                        Self.scaleToBoundsSize(desk, targetSize: Self.targetBoundsSize)
+                    }
+                }
+            }
+
+            // Place root near user on surface in front
             _ = content.subscribe(to: SceneEvents.Update.self) { _ in
-                guard blockState.isRepositioningMode,
-                      let root = blockState.rootEntity,
-                      let planeAnchor = blockState.planeAnchor,
-                      let deviceAnchor = handTrackingManager.queryDeviceAnchor() else { return }
+                guard let planeAnchor = blockState.planeAnchor else { return }
 
-                let t = deviceAnchor.originFromAnchorTransform
-                let devicePos = SIMD3<Float>(t.columns.3.x, t.columns.3.y, t.columns.3.z)
-                // Forward = -Z in camera space
-                let forward = SIMD3<Float>(-t.columns.2.x, -t.columns.2.y, -t.columns.2.z)
-                let forwardNorm = simd_normalize(forward)
+                if let deviceAnchor = handTrackingManager.queryDeviceAnchor() {
+                    // Device tracking: 45cm in front of user on the surface
+                    let t = deviceAnchor.originFromAnchorTransform
+                    let devicePos = SIMD3<Float>(t.columns.3.x, t.columns.3.y, t.columns.3.z)
+                    let forward = SIMD3<Float>(-t.columns.2.x, -t.columns.2.y, -t.columns.2.z)
+                    let horizontalForward = simd_normalize(SIMD3<Float>(forward.x, 0, forward.z))
 
-                // Project gaze ray onto horizontal surface ~0.5m below head (table height)
-                let surfaceY = devicePos.y - 0.5
-                let planeNormal = SIMD3<Float>(0, 1, 0)
-                let denom = simd_dot(forwardNorm, planeNormal)
-                guard abs(denom) > 0.01 else { return } // avoid parallel
-                let tHit = (surfaceY - devicePos.y) / denom
-                guard tHit > 0.1, tHit < 5.0 else { return } // 0.1m–5m in front
-                let hitWorld = devicePos + forwardNorm * tHit
+                    if simd_length(horizontalForward) > 0.1 {
+                        let point45cmOut = devicePos + horizontalForward * 0.45
+                        let surfaceY = planeAnchor.position(relativeTo: nil).y
+                        let hitWorld = SIMD3<Float>(point45cmOut.x, surfaceY, point45cmOut.z)
 
-                let localPos = planeAnchor.convert(position: hitWorld, from: nil)
-                root.position = SIMD3<Float>(localPos.x, 0.2, localPos.z)
+                        // Root: only when initial placement or repositioning (palm open)
+                        let shouldUpdateRoot = !blockState.hasInitialPlacement
+                            || (blockState.isRepositioningMode && handTrackingManager.isPalmCurrentlyOpen())
+                        if shouldUpdateRoot, let root = blockState.rootEntity {
+                            let localPos = planeAnchor.convert(position: hitWorld, from: nil)
+                            let middleChildCenterOffset: Float = Self.targetBoundsSize / 2
+                            root.position = SIMD3<Float>(localPos.x, localPos.y - middleChildCenterOffset, localPos.z)
+                            blockState.hasInitialPlacement = true
+                        }
+                    }
+                } else {
+                    // Simulator or no tracking
+                    if let root = blockState.rootEntity {
+                        root.position = [0, 0, -0.5]
+                        blockState.hasInitialPlacement = true
+                    }
+                }
             }
         } update: { _ in
-            let newMaterial = SimpleMaterial(color: boxColor, isMetallic: false)
-            for entity in blockState.childEntities {
-                guard var modelComponent = entity.components[ModelComponent.self] else { continue }
-                modelComponent.materials = [newMaterial]
-                entity.components[ModelComponent.self] = modelComponent
-            }
+            // No color updates; models use static usdz appearance
         }
         .onChange(of: appModel.repositioningMode) { _, newValue in
             blockState.isRepositioningMode = newValue
@@ -110,7 +161,6 @@ struct ImmersiveView: View {
         .onAppear {
             blockState.isRepositioningMode = appModel.repositioningMode
             handTrackingManager.isRepositioningMode = appModel.repositioningMode
-            startWebSocket()
             startSpawnLoop()
             // Defer hand tracking so the box renders first (ARKit session can delay initial render)
             // Skip on simulator: hand tracking is not supported and produces "not authorized" errors
@@ -127,91 +177,70 @@ struct ImmersiveView: View {
             spawnTask = nil
             setupTask?.cancel()
             setupTask = nil
-            wsTask?.cancel(with: .goingAway, reason: nil)
-            wsTask = nil
             handTrackingManager.stopTracking()
             blockState.rootEntity = nil
-            blockState.childEntities = []
+            blockState.characterEntities = []
             blockState.planeAnchor = nil
+            blockState.whiteboardEntity = nil
+            blockState.completeTemplate = nil
+            blockState.computerSpawnTemplate = nil
+            blockState.hasInitialPlacement = false
+        }
+    }
+
+    /// Placeholder desk when usdz load fails (visible brown box).
+    private static func makePlaceholderDesk() -> Entity {
+        let mesh = MeshResource.generateBox(width: 0.06, height: 0.06, depth: 0.06)
+        let mat = SimpleMaterial(color: .systemBrown, isMetallic: false)
+        return ModelEntity(mesh: mesh, materials: [mat])
+    }
+
+    /// Scales an entity so its visual bounding box fits within a cube of the given size.
+    /// Falls back to 0.01 if bounds are empty or would produce invisible scale.
+    private static func scaleToBoundsSize(_ entity: Entity, targetSize: Float) {
+        let bounds = entity.visualBounds(relativeTo: entity)
+        let extents = bounds.extents
+        let maxExtent = max(extents.x, extents.y, extents.z)
+        if maxExtent > 0 {
+            let scaleFactor = targetSize / maxExtent
+            // Clamp to avoid invisible (too small) or huge models
+            let clamped = min(max(scaleFactor, 0.001), 10)
+            entity.scale = [clamped, clamped, clamped]
+        } else {
+            entity.scale = [0.01, 0.01, 0.01]  // fallback for empty bounds
         }
     }
 
     private func startSpawnLoop() {
         spawnTask = Task { @MainActor in
-            // Brief delay so RealityView has time to create root
-            try? await Task.sleep(for: .seconds(0.5))
+            // Brief delay so RealityView has time to create root and load complete.usdz
+            try? await Task.sleep(for: .seconds(1.5))
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(1))
                 guard !Task.isCancelled else { return }
                 guard let root = blockState.rootEntity else { continue }
 
-                let count = blockState.childEntities.count
+                let count = blockState.characterEntities.count
                 if count >= Self.maxAgents {
-                    // Remove all children and reset
-                    for child in blockState.childEntities {
-                        child.removeFromParent()
+                    // Remove all characters and reset (desks stay)
+                    for character in blockState.characterEntities {
+                        character.removeFromParent()
                     }
-                    blockState.childEntities = []
+                    blockState.characterEntities = []
                 } else {
-                    // Add one agent at the next grid spot
-                    let pos = Self.gridPositions[count]
-                    let mesh = MeshResource.generateBox(size: [Self.cubeSize, Self.cubeSize, Self.cubeSize])
-                    let material = SimpleMaterial(color: boxColor, isMetallic: false)
-                    let child = ModelEntity(mesh: mesh, materials: [material])
-                    child.name = "agent_\(count)"
-                    child.position = pos
-                    root.addChild(child)
-                    blockState.childEntities.append(child)
-                }
-            }
-        }
-    }
-
-    private func startWebSocket() {
-        guard let url = APIConfig.wsDemoURL else {
-            print("[Demo] Invalid WebSocket URL")
-            return
-        }
-        let task = URLSession.shared.webSocketTask(with: url)
-        wsTask = task
-        task.resume()
-        receiveColor()
-    }
-
-    private func receiveColor() {
-        wsTask?.receive { result in
-            switch result {
-            case .success(let message):
-                switch message {
-                case .string(let text):
-                    if let data = text.data(using: .utf8),
-                       let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                       let r = json["r"] as? Int,
-                       let g = json["g"] as? Int,
-                       let b = json["b"] as? Int {
-                        let color = UIColor(
-                            red: CGFloat(r) / 255,
-                            green: CGFloat(g) / 255,
-                            blue: CGFloat(b) / 255,
-                            alpha: 1
-                        )
-                        Task { @MainActor in
-                            boxColor = color
-                        }
+                    // Spawn one character at the next grid spot
+                    let character: Entity
+                    if let template = blockState.completeTemplate {
+                        character = template.clone(recursive: true)
+                        Self.scaleToBoundsSize(character, targetSize: Self.deskTargetSize)
+                    } else {
+                        character = Self.makePlaceholderDesk()
                     }
-                case .data:
-                    break
-                @unknown default:
-                    break
-                }
-                receiveColor() // continue receiving
-            case .failure(let error):
-                print("[Demo] WebSocket error: \(error.localizedDescription)")
-                // Reconnect after delay
-                Task { @MainActor in
-                    try? await Task.sleep(for: .seconds(2))
-                    guard wsTask != nil else { return }
-                    startWebSocket()
+                    character.name = "character_\(count)"
+                    let gridPos = Self.gridPositions[count]
+                    character.position = [gridPos.x, Self.deskTargetSize / 2, gridPos.z]
+                    root.addChild(character)
+                    blockState.characterEntities.append(character)
                 }
             }
         }
@@ -219,7 +248,6 @@ struct ImmersiveView: View {
 
     private func setupHandTracking() {
         handTrackingManager.onOpenPalmDetected = {
-            await sendGestureToServer("open_palm")
             await triggerRecordOnce()
         }
 
@@ -228,15 +256,6 @@ struct ImmersiveView: View {
 
         Task {
             await handTrackingManager.startTracking()
-        }
-    }
-
-    private func sendGestureToServer(_ gesture: String) {
-        let msg: [String: Any] = ["type": "gesture", "gesture": gesture]
-        guard let data = try? JSONSerialization.data(withJSONObject: msg),
-              let text = String(data: data, encoding: .utf8) else { return }
-        wsTask?.send(.string(text)) { error in
-            if let error { print("[Demo] WebSocket send failed: \(error)") }
         }
     }
 

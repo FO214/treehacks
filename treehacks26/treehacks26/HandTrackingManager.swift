@@ -44,6 +44,14 @@ final class HandTrackingManager {
         return worldTracking.queryDeviceAnchor(atTimestamp: CACurrentMediaTime())
     }
 
+    /// True if either hand currently has an open palm (for gaze repositioning gate).
+    func isPalmCurrentlyOpen() -> Bool {
+        let anchors = handTracking.latestAnchors
+        if let left = anchors.leftHand, isOpenPalm(anchor: left) { return true }
+        if let right = anchors.rightHand, isOpenPalm(anchor: right) { return true }
+        return false
+    }
+
     func startTracking() async {
         guard HandTrackingProvider.isSupported else {
             print("[HandTracking] Hand tracking not supported on this device")
