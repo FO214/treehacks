@@ -16,4 +16,6 @@ if [ -f .venv/bin/activate ]; then
 fi
 
 echo "[start] Starting FastAPI (fix + voice) on :8000..."
+# Unbuffered output so print() from server shows immediately
+export PYTHONUNBUFFERED=1
 exec uvicorn server.main:app --host 0.0.0.0 --port 8000

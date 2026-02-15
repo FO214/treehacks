@@ -45,6 +45,11 @@ final class DemoBlockState {
     /// True after we've placed root near user; avoids spawn at plane anchor center (often far away).
     var hasInitialPlacement = false
 
+    /// Debug: last WebSocket message received (shown on-screen).
+    var lastWsMessage: String = ""
+    /// Debug: WebSocket connection status.
+    var wsConnected: Bool = false
+
     /// User closed the webview for this agent; hide webview and remove character.
     func closeWebview(agentId: Int) {
         testingWebviewURLs.removeValue(forKey: agentId)
@@ -123,7 +128,7 @@ struct ImmersiveView: View {
             Task { @MainActor in
                 if let whiteboard = try? await Entity(named: "fixed_whiteboard.usdc", in: realityKitContentBundle) {
                     whiteboard.name = "whiteboard"
-                    whiteboard.position = [0, 0.5 * Self.scaleFactor, -0.3 * Self.scaleFactor]  // in front of origin
+                    whiteboard.position = [0, 0.5 * Self.scaleFactor - 2, -0.3 * Self.scaleFactor]  // 2m lower, in front of origin
                     anchor.addChild(whiteboard)
                     Self.scaleToBoundsSize(whiteboard, targetSize: Self.targetBoundsSize * 15 / 4)  // 1/4 size
                     blockState.whiteboardEntity = whiteboard
@@ -270,6 +275,23 @@ struct ImmersiveView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .allowsHitTesting(false)
             }
+
+            // Debug overlay: WebSocket status (bottom-left)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(blockState.wsConnected ? "WS: connected" : "WS: disconnected")
+                    .font(.caption)
+                    .foregroundStyle(blockState.wsConnected ? .green : .orange)
+                if !blockState.lastWsMessage.isEmpty {
+                    Text(blockState.lastWsMessage)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(3)
+                }
+            }
+            .padding(12)
+            .glassBackgroundEffect(in: .rect(cornerRadius: 12))
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+            .allowsHitTesting(false)
         }
         .onChange(of: appModel.repositioningMode) { _, newValue in
             blockState.isRepositioningMode = newValue
@@ -312,6 +334,8 @@ struct ImmersiveView: View {
             blockState.characterTemplate = nil
             blockState.computerDeskTemplate = nil
             blockState.hasInitialPlacement = false
+            blockState.wsConnected = false
+            blockState.lastWsMessage = ""
         }
     }
 
@@ -357,10 +381,11 @@ struct ImmersiveView: View {
 
     private func startSpawnWebSocket() {
         guard let url = APIConfig.wsSpawnURL else {
-            print("[ImmersiveView] Invalid spawn WebSocket URL")
+            blockState.lastWsMessage = "Invalid WebSocket URL"
             return
         }
         spawnWebSocketTask = Task { @MainActor in
+            blockState.lastWsMessage = "Connecting…"
             // Brief delay so RealityView has time to create root and load assets
             try? await Task.sleep(for: .seconds(1.5))
             guard !Task.isCancelled else { return }
@@ -368,14 +393,16 @@ struct ImmersiveView: View {
             let wsTask = URLSession.shared.webSocketTask(with: url)
             spawnWebSocket = wsTask
             wsTask.resume()
-            print("[ws/spawn] client connected to \(url)")
+            blockState.wsConnected = true
+            blockState.lastWsMessage = "Connected to \(url.absoluteString)"
 
             while !Task.isCancelled {
                 do {
                     let message = try await wsTask.receive()
                     switch message {
                     case .string(let text):
-                        print("[ws/spawn] ← received: \(text.prefix(200))\(text.count > 200 ? "…" : "")")
+                        let preview = String(text.prefix(80)) + (text.count > 80 ? "…" : "")
+                        blockState.lastWsMessage = preview
                         if let data = text.data(using: .utf8),
                            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                            let type = json["type"] as? String {
@@ -403,11 +430,12 @@ struct ImmersiveView: View {
                     }
                 } catch {
                     if !Task.isCancelled {
-                        print("[ImmersiveView] Spawn WebSocket error: \(error)")
+                        blockState.lastWsMessage = "Error: \(error.localizedDescription)"
                     }
                     break
                 }
             }
+            blockState.wsConnected = false
         }
     }
 
