@@ -285,9 +285,10 @@ async def _ws_send_agent_cycle(websocket: WebSocket) -> None:
 
 @app.websocket("/ws/spawn")
 async def websocket_spawn(websocket: WebSocket):
-    """Stream agent lifecycle messages and jump_ping to Vision Pro (DEBUG mode)."""
+    """Vision Pro agent UI. Sends debug cycle + jump_ping; also registers with event_bus so real events from poke-mcp (POST /internal/event) are forwarded."""
     await websocket.accept()
-    print("[ws/spawn] client connected — starting debug cycle + jump_ping", flush=True)
+    event_bus.register(websocket)
+    print("[ws/spawn] client connected — debug cycle + jump_ping + event_bus", flush=True)
     try:
         await asyncio.gather(
             _ws_send_agent_cycle(websocket),

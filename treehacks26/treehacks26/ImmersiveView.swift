@@ -60,6 +60,8 @@ final class DemoBlockState {
     var lastWsMessage: String = ""
     /// Debug: WebSocket connection status.
     var wsConnected: Bool = false
+    /// Agent IDs that received create_agent_thinking before root was ready; spawn when root appears.
+    var pendingAgentSpawns: Set<Int> = []
 
     /// User closed the webview for this agent; hide webview and remove character.
     func closeWebview(agentId: Int) {
@@ -303,6 +305,15 @@ struct ImmersiveView: View {
                             blockState.hasInitialPlacement = true
                         }
                     }
+
+                    // Spawn any agents that arrived before root was ready
+                    if blockState.rootEntity != nil, !blockState.pendingAgentSpawns.isEmpty {
+                        let pending = blockState.pendingAgentSpawns
+                        blockState.pendingAgentSpawns = []
+                        for agentId in pending {
+                            spawnOrResetCharacter(agentId: agentId, targetState: .thinking)
+                        }
+                    }
                 }
             }
         } update: { content, attachments in
@@ -418,6 +429,7 @@ struct ImmersiveView: View {
             blockState.wasPalmOpenForReposition = false
             blockState.wsConnected = false
             blockState.lastWsMessage = ""
+            blockState.pendingAgentSpawns = []
         }
     }
 
@@ -662,7 +674,12 @@ struct ImmersiveView: View {
 
     /// Spawns or resets a character in the given state. Handles out-of-order messages.
     private func spawnOrResetCharacter(agentId: Int, targetState: AgentState, vercelLink: String = "") {
-        guard let root = blockState.rootEntity else { return }
+        guard let root = blockState.rootEntity else {
+            if targetState == .thinking {
+                blockState.pendingAgentSpawns.insert(agentId)
+            }
+            return
+        }
 
         // Full reset of slot (idempotent)
         blockState.testingWebviewURLs.removeValue(forKey: agentId)

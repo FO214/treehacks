@@ -31,7 +31,7 @@ STT_MODEL = os.environ.get("STT_MODEL") or (
 TTS_MODEL = os.environ.get("TTS_MODEL") or "gpt-4o-mini-tts"
 TTS_VOICE = os.environ.get("TTS_VOICE") or ("Rachel" if PROVIDER == "other" else "alloy")
 ELEVENLABS_MODEL = os.environ.get("ELEVENLABS_MODEL") or "eleven_turbo_v2_5"
-TTS_SPEED = float(os.environ.get("TTS_SPEED") or "1.0")
+TTS_SPEED = float(os.environ.get("TTS_SPEED") or os.environ.get("TTS_VOICE_SPEED") or "1.0")
 TTS_RESPONSE_FORMAT = (os.environ.get("TTS_RESPONSE_FORMAT") or "").strip().lower()
 TTS_BATCH_QUEUE = (os.environ.get("TTS_BATCH_QUEUE") or "true").lower() != "false"
 TTS_BATCH_SEPARATOR = os.environ.get("TTS_BATCH_SEPARATOR") or " "
@@ -369,6 +369,12 @@ def _synthesize_speech(text: str, output_path: str, fmt: str = "wav") -> None:
 
     if PROVIDER == "other" and ELEVENLABS_API_KEY:
         voice_id = ELEVENLABS_VOICES.get(TTS_VOICE.lower(), TTS_VOICE)
+        payload = {
+            "text": text,
+            "model_id": ELEVENLABS_MODEL,
+            "output_format": "mp3_44100_128",
+            "voice_settings": {"speed": TTS_SPEED},
+        }
         with httpx.Client() as client:
             r = client.post(
                 f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
@@ -376,7 +382,7 @@ def _synthesize_speech(text: str, output_path: str, fmt: str = "wav") -> None:
                     "xi-api-key": ELEVENLABS_API_KEY,
                     "Content-Type": "application/json",
                 },
-                json={"text": text, "model_id": ELEVENLABS_MODEL, "output_format": "mp3_44100_128"},
+                json=payload,
             )
             r.raise_for_status()
             Path(output_path).write_bytes(r.content)
