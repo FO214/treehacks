@@ -9,7 +9,10 @@ import ARKit
 import RealityKitContent
 import UIKit
 
-/// Agent state: thinking → working → testing (then jump + delete).
+/// Agent state machine: thinking → working → testing. Strict order; out-of-order messages ignored.
+/// - thinking: Character spawned, awaiting start_working
+/// - working: Awaiting agent_start_testing
+/// - testing: Webview shown, character persists until user closes
 enum AgentState: String {
     case thinking
     case working
@@ -92,7 +95,8 @@ struct ImmersiveView: View {
     }
 
     var body: some View {
-        RealityView { content, attachments in
+        ZStack {
+            RealityView { content, attachments in
             // Root entity: invisible anchor for children, sits on surface
             let root = Entity()
             root.name = "demoRoot"
@@ -159,7 +163,7 @@ struct ImmersiveView: View {
 
             // Load templates and create 9 static desks (computer on desk)
             Task { @MainActor in
-                if let character = try? await Entity(named: "character.usdc", in: realityKitContentBundle) {
+                if let character = try? await Entity(named: "char.usdc", in: realityKitContentBundle) {
                     blockState.characterTemplate = character
                 }
                 if let computer = try? await Entity(named: "computerSpawn_2.usdz", in: realityKitContentBundle),
@@ -175,9 +179,8 @@ struct ImmersiveView: View {
                         Self.scaleToBoundsSize(desk, targetSize: Self.targetBoundsSize * Self.deskAndCharacterSizeMultiplier)
                     }
 
-                    // Palm tree: same position and bounding box as first desk (slot 0)
+                    // Palm tree: same x,z as first desk, base on floor (y=0)
                     let gridPos0 = Self.gridPositions[0]
-                    let deskY = Self.targetBoundsSize / 2 + 1.2 - 0.5
                     let deskTargetSize = Self.targetBoundsSize * Self.deskAndCharacterSizeMultiplier
                     let palmTree: Entity
                     if let model = try? await Entity(named: "palmtreelowpolygon.usdz", in: realityKitContentBundle) {
@@ -188,8 +191,9 @@ struct ImmersiveView: View {
                         Self.scaleToBoundsSize(palmTree, targetSize: deskTargetSize)
                     }
                     palmTree.name = "palm_tree"
-                    let palmDir = simd_normalize(SIMD3<Float>(gridPos0.x, 0, gridPos0.z))
-                    palmTree.position = [gridPos0.x + palmDir.x * 2, deskY, gridPos0.z + palmDir.z * 2]  // 2m farther from grid
+                    // Floor is at y=0; put base on floor (center at half-height for origin-at-center models)
+                    let palmHalfHeight = deskTargetSize / 2
+                    palmTree.position = [gridPos0.x, palmHalfHeight, gridPos0.z]
                     root.addChild(palmTree)
                     blockState.palmTreeEntity = palmTree
                 }
@@ -240,12 +244,31 @@ struct ImmersiveView: View {
             ForEach(1...Self.maxAgents, id: \.self) { agentId in
                 Attachment(id: "webview_\(agentId)") {
                     WebViewWithClose(
-                        url: URL(string: blockState.testingWebviewURLs[agentId] ?? "https://google.com"),
+                        url: URL(string: blockState.testingWebviewURLs[agentId] ?? "") ?? URL(string: "https://www.google.com"),
                         onClose: { blockState.closeWebview(agentId: agentId) }
                     )
                     .frame(width: 2000, height: 1500)
                     .glassBackgroundEffect()
                 }
+            }
+        }
+
+            // Overlay: show when root is searching for a surface to latch to
+            if !blockState.hasInitialPlacement {
+                VStack {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .scaleEffect(0.9)
+                        Text("Finding surface…")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 12)
+                    .glassBackgroundEffect(in: .rect(cornerRadius: 16))
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .allowsHitTesting(false)
             }
         }
         .onChange(of: appModel.repositioningMode) { _, newValue in
@@ -345,12 +368,14 @@ struct ImmersiveView: View {
             let wsTask = URLSession.shared.webSocketTask(with: url)
             spawnWebSocket = wsTask
             wsTask.resume()
+            print("[ws/spawn] client connected to \(url)")
 
             while !Task.isCancelled {
                 do {
                     let message = try await wsTask.receive()
                     switch message {
                     case .string(let text):
+                        print("[ws/spawn] ← received: \(text.prefix(200))\(text.count > 200 ? "…" : "")")
                         if let data = text.data(using: .utf8),
                            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                            let type = json["type"] as? String {
@@ -390,9 +415,10 @@ struct ImmersiveView: View {
         await MainActor.run {
             guard let root = blockState.rootEntity else { return }
 
-            // Remove existing character and any open webview at this slot
+            // Full reset of slot: remove character, webview, and state (idempotent)
             blockState.testingWebviewURLs.removeValue(forKey: agentId)
             blockState.webviewEntities[agentId]?.removeFromParent()
+            blockState.agentStates.removeValue(forKey: agentId)
             if let existing = blockState.characterEntities[agentId] {
                 existing.removeFromParent()
                 blockState.characterEntities.removeValue(forKey: agentId)
@@ -444,43 +470,33 @@ struct ImmersiveView: View {
 
     private func handleAgentStartWorking(agentId: Int) async {
         await MainActor.run {
-            guard blockState.agentStates[agentId] == .thinking else { return }
+            guard blockState.agentStates[agentId] == .thinking,
+                  blockState.characterEntities[agentId] != nil else { return }
             blockState.agentStates[agentId] = .working
         }
     }
 
     private func handleAgentStartTesting(agentId: Int, vercelLink: String, browserbaseLink: String) async {
         await MainActor.run {
-            guard blockState.agentStates[agentId] == .working else { return }
+            guard blockState.agentStates[agentId] == .working,
+                  let character = blockState.characterEntities[agentId] else { return }
             blockState.agentStates[agentId] = .testing
-            guard let character = blockState.characterEntities[agentId] else { return }
 
-            // Show webview above agent (vercel link)
-            blockState.testingWebviewURLs[agentId] = vercelLink
+            // Show webview above agent (vercel link); fallback to google.com if empty
+            let urlToShow = vercelLink.trimmingCharacters(in: .whitespacesAndNewlines)
+            blockState.testingWebviewURLs[agentId] = urlToShow.isEmpty ? "https://www.google.com" : urlToShow
             if let webviewEntity = blockState.webviewEntities[agentId] {
                 webviewEntity.removeFromParent()
                 webviewEntity.position = [0, 1.0, 1.0]  // 1m above character, 1m forward (Z)
                 character.addChild(webviewEntity)
             }
 
-            // Smooth jump 1m upward; character stays until user closes webview
+            // Smooth jump 1m upward; webview stays child of character, both persist until user closes
             let currentTransform = character.transform
             var targetTransform = currentTransform
             targetTransform.translation.y += 1.0  // 1m up
 
             character.move(to: targetTransform, relativeTo: character.parent, duration: 0.8, timingFunction: .easeOut)
-
-            Task { @MainActor in
-                try? await Task.sleep(for: .seconds(0.9))  // Wait for animation
-                // Reparent webview to root so it persists (user closes manually; character stays until then)
-                if let webviewEntity = blockState.webviewEntities[agentId], let root = blockState.rootEntity {
-                    let worldPos = webviewEntity.position(relativeTo: nil)
-                    let localPos = root.convert(position: worldPos, from: nil)
-                    webviewEntity.removeFromParent()
-                    webviewEntity.position = localPos
-                    root.addChild(webviewEntity)
-                }
-            }
         }
     }
 

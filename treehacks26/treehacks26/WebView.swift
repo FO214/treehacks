@@ -17,7 +17,19 @@ struct WebView: UIViewRepresentable {
 
     func updateUIView(_ webView: WKWebView, context: Context) {
         guard let url else { return }
-        webView.load(URLRequest(url: url))
+        // Only load when URL changes to avoid reload loops and ensure correct link loads
+        if context.coordinator.lastLoadedURL != url {
+            context.coordinator.lastLoadedURL = url
+            webView.load(URLRequest(url: url))
+        }
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    class Coordinator {
+        var lastLoadedURL: URL?
     }
 }
 
