@@ -8,7 +8,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
 from mcp import ClientSession
-from mcp.client.http import http_client
+from mcp.client.streamable_http import streamablehttp_client
 from pydantic import BaseModel
 
 
@@ -27,7 +27,7 @@ class FixResponse(BaseModel):
 async def get_mcp_session():
     """Connect to MCP server over HTTP and yield session."""
     mcp_url = os.environ.get("MCP_HTTP_URL", "http://127.0.0.1:8001/mcp")
-    async with http_client(mcp_url) as (read_stream, write_stream):
+    async with streamablehttp_client(mcp_url) as (read_stream, write_stream, _):
         async with ClientSession(read_stream, write_stream) as session:
             await session.initialize()
             yield session

@@ -47,6 +47,8 @@ Then, examine the file tree of the project which will be enclosed in <file_tree>
 
 Your task is to analyze the system design explanation and identify key components, modules, or services mentioned. Then, try your best to map these components to what you believe could be their corresponding directories and files in the provided file tree.
 
+The next step will render these components as a single diagram at 1920×1080 (16:9 widescreen). So prefer a focused set of main components that can fit that aspect ratio—typically 4–12 major components—rather than an exhaustive list that would force a cramped or very tall layout.
+
 Guidelines:
 1. Focus on major components described in the system design.
 2. Look for directories and files that clearly correspond to these components.
@@ -82,12 +84,13 @@ To create the Mermaid.js diagram:
    c. The diagram accurately reflects the architecture described in the explanation
    d. The layout is logical and easy to understand
 
-IMPORTANT!!: Please orient and draw the diagram as vertically as possible. You must avoid long horizontal lists of nodes and sections!
+IMPORTANT - Layout for 1920×1080 (16:9): The diagram is rendered at exactly 1920×1080. You must generate Mermaid that fits this aspect ratio:
+- Use flowchart with direction LR (left-to-right) so the graph spreads horizontally. Start the diagram with: flowchart LR
+- If you use subgraphs, arrange them side by side or in a small grid (e.g. 2–3 columns), not one long vertical stack.
+- Keep the number of rows/ranks low (prefer wider, fewer rows) so the result is wider than tall.
+- Avoid long vertical chains of nodes; prefer branching and horizontal flow so the layout fills 16:9 without large empty margins.
 
-You must include click events for components that have been specified in the <component_mapping>:
-- Do not include the full url. Use only the path, e.g: `click Example "app/example.js"`
-- Do this for as many components as specified in the component mapping.
-- Paths are for click events only; do not show paths in node names.
+Do not add any click events or links. Output a static diagram only (no click directives).
 
 Your output should be valid Mermaid.js code that can be rendered into a diagram.
 

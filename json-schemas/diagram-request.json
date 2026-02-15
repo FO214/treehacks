@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "diagram-request",
+  "title": "DiagramRequest",
+  "description": "Request for repo → diagram PNG - Vision Pro → Server",
+  "type": "object",
+  "required": ["directory"],
+  "properties": {
+    "directory": {
+      "type": "string",
+      "description": "Path to project directory (must contain README)"
+    },
+    "output_path": {
+      "type": "string",
+      "description": "Optional path to write PNG on server"
+    }
+  }
+}

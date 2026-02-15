@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "fix-request",
+  "title": "FixRequest",
+  "description": "Request body for POST /fix - Vision Pro → Server",
+  "type": "object",
+  "required": ["text_input"],
+  "properties": {
+    "text_input": {
+      "type": "string",
+      "description": "Fix instruction (e.g. 'Fix the bug in auth.py')"
+    },
+    "repo_url": {
+      "type": "string",
+      "format": "uri",
+      "description": "Optional repo URL; server uses default if omitted"
+    }
+  }
+}
