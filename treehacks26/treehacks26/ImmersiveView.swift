@@ -149,25 +149,25 @@ struct ImmersiveView: View {
                     anchor.addChild(whiteboard)
                     Self.scaleToBoundsSize(whiteboard, targetSize: Self.targetBoundsSize * 15 / 2)  // 2x size (was 15/4)
                     blockState.whiteboardEntity = whiteboard
+                }
 
-                    // Diagram from project root (diagram.svg → diagram.png), snapped to front of whiteboard
-                    let loadDiagram = true
-                    if loadDiagram {
-                        do {
-                            let texture: TextureResource?
-                            if let url = Bundle.main.url(forResource: "diagram", withExtension: "png") {
-                                texture = try await TextureResource.load(contentsOf: url)
-                            } else {
-                                texture = try? await TextureResource.load(named: "diagram", in: .main)
-                            }
-                            if let texture, let diagramPlane = Self.makeDiagramPlane(texture: texture) {
-                                diagramPlane.name = "diagram"
-                                diagramPlane.position = [0, 0, 0.02 * Self.scaleFactor]  // Slightly in front of whiteboard face
-                                whiteboard.addChild(diagramPlane)
-                            }
-                        } catch {
-                            print("[ImmersiveView] Diagram texture load failed: \(error)")
+                // Diagram plane: separate object slightly closer to user than whiteboard (z=-0.15 vs whiteboard z=-0.3)
+                let loadDiagram = true
+                if loadDiagram {
+                    do {
+                        let texture: TextureResource?
+                        if let url = Bundle.main.url(forResource: "diagram", withExtension: "png") {
+                            texture = try await TextureResource.load(contentsOf: url)
+                        } else {
+                            texture = try? await TextureResource.load(named: "diagram", in: .main)
                         }
+                        if let texture, let diagramPlane = Self.makeDiagramPlane(texture: texture) {
+                            diagramPlane.name = "diagram"
+                            diagramPlane.position = [0, 0.5 * Self.scaleFactor - 2, -0.15 * Self.scaleFactor]
+                            anchor.addChild(diagramPlane)
+                        }
+                    } catch {
+                        print("[ImmersiveView] Diagram texture load failed: \(error)")
                     }
                 }
             }
@@ -233,6 +233,19 @@ struct ImmersiveView: View {
                     ])
                     root.addChild(palmTree)
                     blockState.palmTreeEntity = palmTree
+
+                    // Record button: large interactive button 2.5m off ground at tree, sends record-once on tap
+                    let recordButton = ModelEntity(
+                        mesh: MeshResource.generateBox(width: 0.6, height: 0.15, depth: 0.6),
+                        materials: [SimpleMaterial(color: .systemBlue, isMetallic: false)]
+                    )
+                    recordButton.name = "record_button"
+                    recordButton.position = [palmXZ.x, 2.5, palmXZ.y]
+                    recordButton.components.set([
+                        CollisionComponent(shapes: [ShapeResource.generateBox(width: 0.6, height: 0.15, depth: 0.6)]),
+                        InputTargetComponent(),
+                    ])
+                    root.addChild(recordButton)
                 }
             }
 
@@ -315,6 +328,8 @@ struct ImmersiveView: View {
                             await handleJumpPing()
                             postPalmTouched()
                         }
+                    } else if value.entity.name == "record_button" {
+                        postRecordOnce()
                     }
                 }
         )
@@ -336,6 +351,13 @@ struct ImmersiveView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .allowsHitTesting(false)
             }
+
+            // Floating webview: treehacks-agent-repo (interactive mode overlay)
+            WebView(url: URL(string: "https://treehacks-agent-repo.vercel.app"))
+                .frame(width: 600, height: 450)
+                .glassBackgroundEffect(in: .rect(cornerRadius: 16))
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                .padding(24)
 
             // Debug overlay: WebSocket status (bottom-left)
             VStack(alignment: .leading, spacing: 4) {
@@ -726,10 +748,6 @@ struct ImmersiveView: View {
     }
 
     private func setupHandTracking() {
-        handTrackingManager.onOpenPalmDetected = {
-            await triggerRecordOnce()
-        }
-
         // Repositioning is now gaze-based (see SceneEvents.Update subscription)
         handTrackingManager.onOpenPalmForDrag = { _ in }
 
@@ -738,46 +756,22 @@ struct ImmersiveView: View {
         }
     }
 
-    private func triggerRecordOnce() async {
-        // Only trigger when user is within 1m of the palm tree
-        guard let palmTree = blockState.palmTreeEntity,
-              let deviceAnchor = handTrackingManager.queryDeviceAnchor() else {
-            return
-        }
-        let palmTreeWorldPos = palmTree.position(relativeTo: nil)
-        let devicePos = SIMD3<Float>(
-            deviceAnchor.originFromAnchorTransform.columns.3.x,
-            deviceAnchor.originFromAnchorTransform.columns.3.y,
-            deviceAnchor.originFromAnchorTransform.columns.3.z
-        )
-        let distance = simd_distance(devicePos, palmTreeWorldPos)
-        if distance > 1.0 {
-            return  // Too far from palm tree
-        }
-
-        // Call record-once (proxied via FastAPI to voice server)
+    private func postRecordOnce() {
         guard let url = URL(string: "\(APIConfig.baseURL)/record-once") else {
-            print("[HandTracking] Invalid voice server URL")
+            print("[Record] Invalid voice server URL")
             return
         }
-
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.timeoutInterval = 15
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = "{}".data(using: .utf8)
-
-        do {
-            let (data, response) = try await URLSession.shared.data(for: request)
+        URLSession.shared.dataTask(with: request) { _, response, error in
             if let httpResponse = response as? HTTPURLResponse {
-                print("[HandTracking] record-once response: \(httpResponse.statusCode)")
+                print("[Record] record-once response: \(httpResponse.statusCode)")
             }
-            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                print("[HandTracking] record-once result: \(json)")
-            }
-        } catch {
-            print("[HandTracking] record-once failed: \(error)")
-        }
+            if let error { print("[Record] record-once failed: \(error)") }
+        }.resume()
     }
 }
 

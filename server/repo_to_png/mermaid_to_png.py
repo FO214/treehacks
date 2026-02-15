@@ -352,3 +352,43 @@ def mermaid_to_svg(
             output_svg, DEFAULT_WIDTH, DEFAULT_HEIGHT
         )
         return (output_svg.read_bytes(), positions)
+
+
+def mermaid_to_png(
+    mermaid_code: str,
+    *,
+    mmdc_path: str | None = None,
+    background: str = "white",
+) -> bytes:
+    """
+    Render Mermaid diagram to PNG via mmdc. Use this when SVG text (foreignObject)
+    is lost during SVG→PNG conversion; mmdc renders directly to PNG with text intact.
+    """
+    cmd = _get_mmdc_cmd(mmdc_path)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        input_mmd = tmp / "diagram.mmd"
+        output_png = tmp / "diagram.png"
+        config_json = tmp / "mermaid_config.json"
+        config_json.write_text(json.dumps(_MMDC_16_9_CONFIG), encoding="utf-8")
+        sanitized = _sanitize_mermaid_node_labels(mermaid_code)
+        sanitized = _sanitize_mermaid_click_lines(sanitized)
+        normalized = _mermaid_code_for_16_9(sanitized)
+        input_mmd.write_text(normalized, encoding="utf-8")
+
+        args_png = cmd + [
+            "-i", str(input_mmd),
+            "-o", str(output_png),
+            "-c", str(config_json),
+            "-b", background,
+            "-w", str(DEFAULT_WIDTH),
+            "-H", str(DEFAULT_HEIGHT),
+        ]
+
+        result = subprocess.run(args_png, capture_output=True, timeout=90, text=True)
+        if result.returncode != 0:
+            err = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(f"mermaid-cli PNG failed (exit {result.returncode}). {err}")
+
+        return output_png.read_bytes()
