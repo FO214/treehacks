@@ -205,7 +205,7 @@ struct ImmersiveView: View {
                     }
                 }
             }
-        } update: { content in
+        } update: { content, attachments in
             // No color updates; models use static usdz appearance
         } attachments: {
             ForEach(1...Self.maxAgents, id: \.self) { agentId in
