@@ -220,103 +220,165 @@ def _run_browser_smoke_test(
     owner: str,
     repo_name: str,
     github_token: str,
+    instruction: str = "",
 ) -> str:
     """
-    Run a Browserbase smoke test against a live tunnel URL and post results as a PR comment.
+    Run an intelligent Browserbase smoke test using Stagehand.
+    Stagehand autonomously navigates and interacts with the page to verify
+    that the instruction was fulfilled, then posts results as a PR comment.
 
     Returns a short summary string for inclusion in the tool output.
     """
-    from browserbase import Browserbase
-    from playwright.sync_api import sync_playwright
-
-    bb_api_key = os.environ.get("BROWSERBASE_API_KEY", "")
-    bb_project_id = os.environ.get("BROWSERBASE_PROJECT_ID", "")
-    if not bb_api_key or not bb_project_id:
-        return "Smoke test skipped: BROWSERBASE_API_KEY or BROWSERBASE_PROJECT_ID not set."
+    import asyncio
 
     pr_number = _extract_pr_number(pr_url)
     if not pr_number:
         return f"Smoke test skipped: could not parse PR number from {pr_url}"
 
-    bb = Browserbase(api_key=bb_api_key)
-    session = bb.sessions.create(project_id=bb_project_id)
-    replay_url = f"https://browserbase.com/sessions/{session.id}"
+    bb_api_key = os.environ.get("BROWSERBASE_API_KEY", "")
+    bb_project_id = os.environ.get("BROWSERBASE_PROJECT_ID", "")
+    model_api_key = os.environ.get("MODEL_API_KEY") or os.environ.get("OPENAI_API_KEY") or os.environ.get("ANTHROPIC_API_KEY", "")
 
-    console_messages: list[str] = []
-    console_errors: list[str] = []
-    status = "Passed"
-    details: dict[str, str] = {}
+    if not bb_api_key or not bb_project_id:
+        return "Smoke test skipped: BROWSERBASE_API_KEY or BROWSERBASE_PROJECT_ID not set."
+    if not model_api_key:
+        return "Smoke test skipped: MODEL_API_KEY (or OPENAI_API_KEY / ANTHROPIC_API_KEY) not set."
 
-    pw = None
-    try:
-        pw = sync_playwright().start()
-        browser = pw.chromium.connect_over_cdp(session.connect_url)
-        context = browser.contexts[0]
-        page = context.pages[0]
+    async def _run_stagehand_test() -> dict:
+        """Async Stagehand test — runs in its own event loop via asyncio.run()."""
+        from stagehand import AsyncStagehand
 
-        # Capture console output
-        def _on_console(msg):
-            text = f"[{msg.type}] {msg.text}"
-            console_messages.append(text)
-            if msg.type in ("error", "warning"):
-                console_errors.append(text)
+        result: dict = {
+            "status": "Passed",
+            "verdict": "",
+            "details": {},
+            "replay_url": "",
+            "agent_message": "",
+        }
 
-        page.on("console", _on_console)
+        client = AsyncStagehand(
+            browserbase_api_key=bb_api_key,
+            browserbase_project_id=bb_project_id,
+            model_api_key=model_api_key,
+        )
+        session = await client.sessions.start(model_name="openai/gpt-4o-mini")
+        result["replay_url"] = f"https://browserbase.com/sessions/{session.id}"
+        print(f"[soot] Stagehand session: {session.id}", flush=True)
 
-        # Navigate to the app
-        start_time = time.time()
         try:
-            response = page.goto(tunnel_url, wait_until="networkidle", timeout=30000)
-            load_time = round(time.time() - start_time, 1)
-            details["Page loaded"] = "yes"
-            details["Load time"] = f"{load_time}s"
-            details["Page title"] = page.title() or "(empty)"
+            # Navigate to the preview
+            print(f"[soot] Navigating to {tunnel_url}...", flush=True)
+            await session.navigate(url=tunnel_url)
+            print("[soot] Page loaded.", flush=True)
+            result["details"]["Page loaded"] = "yes"
 
-            if response and response.status >= 500:
-                status = "Failed"
-                details["HTTP status"] = str(response.status)
-            elif response:
-                details["HTTP status"] = str(response.status)
-        except Exception as nav_err:
-            load_time = round(time.time() - start_time, 1)
-            status = "Failed"
-            details["Page loaded"] = "no"
-            details["Load time"] = f"{load_time}s"
-            details["Error"] = str(nav_err)[:200]
+            # Run the autonomous agent to test the change
+            test_instruction = (
+                f"You are a QA tester. The developer made this change to the website:\n"
+                f'"{instruction}"\n\n'
+                f"Your job:\n"
+                f"1. Look at the current page and check if the change is visible.\n"
+                f"2. If the change involves interactive elements (buttons, links, forms), "
+                f"click/interact with them to verify they work.\n"
+                f"3. Navigate around if needed to find and verify the change.\n"
+                f"4. After testing, report whether the change was implemented correctly."
+            )
 
-        if console_errors:
-            status = "Failed"
-            details["Console errors"] = str(len(console_errors))
-        else:
-            details["Console errors"] = "none"
+            print("[soot] Running Stagehand agent to test changes...", flush=True)
+            execute_response = await session.execute(
+                execute_options={
+                    "instruction": test_instruction,
+                    "max_steps": 10,
+                },
+                agent_config={"model": "openai/gpt-4o-mini"},
+                timeout=120.0,
+            )
 
-        # Give the page a moment to settle, then close
-        page.wait_for_timeout(2000)
-        page.close()
-        browser.close()
+            agent_result = execute_response.data.result
+            agent_message = agent_result.message if agent_result else ""
+            agent_success = agent_result.success if agent_result else False
+            result["agent_message"] = agent_message
+            print(f"[soot] Agent done (success={agent_success}): {agent_message[:200]}", flush=True)
 
+            # Extract a structured verdict from the page after testing
+            extract_response = await session.extract(
+                instruction=(
+                    f"Based on what you see on this page, was the following change "
+                    f"implemented correctly?\n"
+                    f'Change: "{instruction}"\n\n'
+                    f"Return a verdict and short reason."
+                ),
+                schema={
+                    "type": "object",
+                    "properties": {
+                        "verdict": {
+                            "type": "string",
+                            "enum": ["PASS", "FAIL"],
+                            "description": "Whether the change was implemented correctly",
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "One sentence explaining the verdict",
+                        },
+                    },
+                    "required": ["verdict", "reason"],
+                },
+            )
+
+            extracted = extract_response.data.result
+            if isinstance(extracted, dict):
+                v = extracted.get("verdict", "").upper()
+                reason = extracted.get("reason", "")
+                result["verdict"] = reason or agent_message[:300]
+                if "FAIL" in v:
+                    result["status"] = "Failed"
+            else:
+                result["verdict"] = agent_message[:300] if agent_message else "Could not extract verdict."
+
+            result["details"]["Agent steps"] = str(getattr(execute_response.data.result, "steps", "N/A"))
+
+        except Exception as e:
+            print(f"[soot] Stagehand error: {e}", flush=True)
+            result["status"] = "Failed"
+            result["details"]["Error"] = str(e)[:300]
+            result["verdict"] = f"Test error: {str(e)[:200]}"
+
+        finally:
+            try:
+                await session.end()
+            except Exception:
+                pass
+
+        return result
+
+    # Run the async Stagehand test in this thread's own event loop
+    try:
+        test_result = asyncio.run(_run_stagehand_test())
     except Exception as e:
-        status = "Failed"
-        details["Browser error"] = str(e)[:300]
-    finally:
-        if pw:
-            pw.stop()
+        test_result = {
+            "status": "Failed",
+            "verdict": f"Stagehand execution error: {str(e)[:200]}",
+            "details": {"Error": str(e)[:300]},
+            "replay_url": "",
+            "agent_message": "",
+        }
+
+    status = test_result["status"]
+    verdict = test_result["verdict"]
+    details = test_result["details"]
+    replay_url = test_result["replay_url"]
 
     # Build the PR comment
     detail_lines = "\n".join(f"- {k}: {v}" for k, v in details.items())
-    console_section = ""
-    if console_errors:
-        truncated = console_errors[:10]
-        console_section = "\n### Console Output\n```\n" + "\n".join(truncated) + "\n```"
-        if len(console_errors) > 10:
-            console_section += f"\n... and {len(console_errors) - 10} more"
+    verdict_section = f"\n**Verdict:** {verdict}\n" if verdict else ""
+    replay_section = f"\n**Replay:** [Watch browser test recording]({replay_url})\n" if replay_url else ""
 
     comment_body = (
         f"## Smoke Test Results\n\n"
         f"**Status:** {status}\n"
-        f"**Replay:** [Watch browser test recording]({replay_url})\n\n"
-        f"### Details\n{detail_lines}"
-        f"{console_section}\n\n"
+        f"{verdict_section}"
+        f"{replay_section}\n"
+        f"### Details\n{detail_lines}\n\n"
         f"---\n*Tested by [Soot](https://github.com/apps/soot-fix)*"
     )
 
@@ -326,7 +388,7 @@ def _run_browser_smoke_test(
     except Exception as e:
         print(f"[soot] Failed to post smoke test comment: {e}", flush=True)
 
-    return f"Smoke test {status}. Replay: {replay_url}"
+    return f"Smoke test {status}. Verdict: {verdict}. Replay: {replay_url}"
 
 
 # ---------------------------------------------------------------------------
@@ -595,6 +657,7 @@ def run_modal_agent(
                             owner=owner,
                             repo_name=repo_name,
                             github_token=github_token,
+                            instruction=instruction,
                         ).result()
                     print(f"[soot] {smoke_result}", flush=True)
                 else:
