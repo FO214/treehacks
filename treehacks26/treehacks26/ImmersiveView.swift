@@ -25,16 +25,16 @@ struct ImmersiveView: View {
         // IMPORTANT: Initial closure must NOT capture boxColor. If it does, SwiftUI may
         // recreate the entire RealityView when boxColor changes, causing the box to disappear briefly.
         RealityView { content in
-            // Create a box in front of the user
-            let box = MeshResource.generateBox(size: [0.4, 0.4, 0.4])
+            // Cube (0.4m) that snaps to a detected horizontal surface (table/floor)
+            let cube = MeshResource.generateBox(size: [0.4, 0.4, 0.4])
             let material = SimpleMaterial(color: .systemRed, isMetallic: false)
-            let entity = ModelEntity(mesh: box, materials: [material])
+            let entity = ModelEntity(mesh: cube, materials: [material])
             entity.name = "demoBlock"
 
-            // World anchor: shows immediately (no head-tracking wait). Box at 1.2m in front of origin.
-            var transform = matrix_identity_float4x4
-            transform.columns.3 = SIMD4<Float>(0, 0, -1.2, 1)
-            let anchor = AnchorEntity(.world(transform: transform))
+            // Plane anchor: snaps to nearest horizontal surface (table, floor, etc.)
+            let anchor = AnchorEntity(.plane(.horizontal, classification: .any, minimumBounds: [0.4, 0.4]))
+            // Offset cube up by half its height so it sits ON the surface
+            entity.position = [0, 0.2, 0]
             anchor.addChild(entity)
             content.add(anchor)
 
