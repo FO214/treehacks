@@ -62,8 +62,10 @@ struct ImmersiveView: View {
 
     private func fetchDemoValue() async {
         guard let url = URL(string: "\(APIConfig.baseURL)/demo/value") else { return }
+        var request = URLRequest(url: url)
+        request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
         do {
-            let (data, _) = try await URLSession.shared.data(from: url)
+            let (data, _) = try await URLSession.shared.data(for: request)
             if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                let value = json["value"] as? Int {
                 await MainActor.run {
@@ -95,6 +97,7 @@ struct ImmersiveView: View {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
         request.httpBody = "{}".data(using: .utf8)
 
         do {
