@@ -10,16 +10,18 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 import asyncio
+import json as _json
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 from pydantic import BaseModel
 
 from . import voice
+from . import event_bus
 
 
 class FixRequest(BaseModel):
@@ -35,6 +37,9 @@ class FixResponse(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Register the running event loop so event_bus.broadcast_sync works from threads
+    event_bus.set_loop(asyncio.get_running_loop())
+
     voice.voice_startup()
     if voice.TALKBACK_ENABLED and voice.TTS_LOOP_AUTOSTART:
         loop = asyncio.get_running_loop()
@@ -90,10 +95,71 @@ async def fix(request: FixRequest) -> str:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ---------------------------------------------------------------------------
+# WebSocket: /ws/poke — Vision Pro ↔ server event bridge
+# ---------------------------------------------------------------------------
+
+@app.websocket("/ws/poke")
+async def websocket_poke(websocket: WebSocket):
+    """
+    Vision Pro connects here. Receives hand_open / hand_close gestures;
+    broadcasts listening, poke_speaking, and agent_update events back.
+    """
+    await websocket.accept()
+    event_bus.register(websocket)
+    print("[ws/poke] client connected")
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                msg = _json.loads(raw)
+            except _json.JSONDecodeError:
+                continue
+
+            msg_type = msg.get("type", "")
+            print(f"[ws/poke] ← {msg_type}")
+
+            if msg_type == "hand_open":
+                # Start recording from mic
+                voice.start_recording()
+                await event_bus.broadcast({"type": "listening"})
+
+            elif msg_type == "hand_close":
+                # Stop recording, transcribe, send to Poke, speak response
+                async def _on_event(evt: dict):
+                    await event_bus.broadcast(evt)
+
+                await voice.stop_and_process(on_event=_on_event)
+
+    except WebSocketDisconnect:
+        print("[ws/poke] client disconnected")
+    except Exception as e:
+        print(f"[ws/poke] error: {e}")
+    finally:
+        event_bus.unregister(websocket)
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
+@app.post("/internal/event")
+async def internal_event(body: dict):
+    """
+    Receives agent progress events from poke-mcp (cross-process webhook).
+    Broadcasts them to all connected WS clients.
+    """
+    # Wrap in agent_update type if not already set
+    if "type" not in body:
+        body["type"] = "agent_update"
+    await event_bus.broadcast(body)
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
 # Demo: Vision Pro block color (WebSocket rainbow)
+# ---------------------------------------------------------------------------
 import colorsys
-import json as _json
-from fastapi import WebSocket
 
 
 async def _ws_send_rainbow(websocket: WebSocket) -> None:

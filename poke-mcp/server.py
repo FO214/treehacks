@@ -38,6 +38,38 @@ DEFAULT_REPO_URL = "https://github.com/soooooooot/treehacks-agent-repo"
 # before the long-running job finishes.
 RUN_FIX_IN_BACKGROUND = (os.environ.get("RUN_FIX_IN_BACKGROUND", "").strip().lower() in ("1", "true", "yes"))
 
+# ---------------------------------------------------------------------------
+# Event webhook: POST agent progress events to FastAPI /internal/event
+# ---------------------------------------------------------------------------
+EVENT_WEBHOOK_URL = os.environ.get("EVENT_WEBHOOK_URL", "http://localhost:8000/internal/event")
+
+# Atomic agent ID counter (1-9, wrapping)
+_agent_id_counter = 0
+_agent_id_lock = threading.Lock()
+
+
+def _next_agent_id() -> int:
+    """Return the next agent ID (1-9, wrapping)."""
+    global _agent_id_counter
+    with _agent_id_lock:
+        _agent_id_counter = (_agent_id_counter % 9) + 1
+        return _agent_id_counter
+
+
+def _post_event(event: dict) -> None:
+    """Fire-and-forget POST to the FastAPI event webhook."""
+    event.setdefault("type", "agent_update")
+    payload = json.dumps(event).encode()
+    headers = {"Content-Type": "application/json"}
+    try:
+        req = urllib.request.Request(
+            EVENT_WEBHOOK_URL, data=payload, method="POST", headers=headers,
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            resp.read()
+    except Exception as e:
+        print(f"[soot] event webhook failed: {e}", flush=True)
+
 # System prompt: frames the task for fix/change flows (make the modification only,
 # the server handles branching/committing/PR automatically).
 FIX_SYSTEM_PROMPT = """You are a code assistant working in a cloned repository at /repo. Your task is to:
@@ -521,10 +553,13 @@ def run_modal_agent(
     app = modal.App.lookup("treehacks-fix-agent", create_if_missing=True)
     sandbox_image = _get_sandbox_image()
 
+    agent_id = _next_agent_id()
+
     sb = None
     try:
         # ── Create sandbox ────────────────────────────────────────────
         print("[soot] Creating Modal sandbox...", flush=True)
+        _post_event({"agent_id": agent_id, "status": "thinking"})
         sandbox_kwargs: dict = dict(app=app, image=sandbox_image, timeout=10 * 60)
         with modal.enable_output():
             sb = modal.Sandbox.create(**sandbox_kwargs)
@@ -565,6 +600,7 @@ def run_modal_agent(
             )
 
         print("[soot] Running claude-agent-sdk...", flush=True)
+        _post_event({"agent_id": agent_id, "status": "working"})
         agent_p = sb.exec(
             "python", "-c", AGENT_SCRIPT,
             workdir="/repo",
@@ -636,6 +672,7 @@ def run_modal_agent(
         # ── 7. (Optional) Smoke test via Browserbase + Vercel preview ──
         smoke_result = ""
         if smoke_test:
+            _post_event({"agent_id": agent_id, "status": "testing"})
             try:
                 # Wait for Vercel bot to comment with the preview URL
                 pr_number = _extract_pr_number(pr_url)
@@ -673,9 +710,33 @@ def run_modal_agent(
             result_parts.append(f"Smoke test: {smoke_result}")
         result_parts.append("")
         result_parts.append(agent_stdout)
+
+        # ── Emit "done" event with all URLs ──────────────────────────
+        done_event: dict = {
+            "agent_id": agent_id,
+            "status": "done",
+            "pr_url": pr_url,
+        }
+        # Parse smoke result for Vercel/Browserbase URLs and verdict
+        if smoke_result:
+            import re as _re
+            vercel_match = _re.search(r"https://[a-zA-Z0-9\-]+\.vercel\.app", smoke_result)
+            bb_match = _re.search(r"https://browserbase\.com/sessions/[a-zA-Z0-9\-]+", smoke_result)
+            if vercel_match:
+                done_event["vercel_url"] = vercel_match.group(0)
+            if bb_match:
+                done_event["browserbase_url"] = bb_match.group(0)
+            done_event["pass"] = "Passed" in smoke_result or "PASS" in smoke_result
+            # Extract verdict text after "Verdict: "
+            verdict_match = _re.search(r"Verdict:\s*(.+?)(?:\.|$)", smoke_result)
+            if verdict_match:
+                done_event["verdict"] = verdict_match.group(1).strip()
+        _post_event(done_event)
+
         return "\n".join(result_parts)
 
     except Exception as e:
+        _post_event({"agent_id": agent_id, "status": "error", "error_message": str(e)})
         return f"Error: {str(e)}"
 
     finally:
