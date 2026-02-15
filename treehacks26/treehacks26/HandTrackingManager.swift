@@ -164,7 +164,7 @@ final class HandTrackingManager {
     }
 
     private func isFingerExtended(skeleton: HandSkeleton, finger: Finger) -> Bool {
-        let (extended, dot) = fingerExtendedWithDot(skeleton: skeleton, finger: finger)
+        let (extended, _) = fingerExtendedWithDot(skeleton: skeleton, finger: finger)
         return extended
     }
 

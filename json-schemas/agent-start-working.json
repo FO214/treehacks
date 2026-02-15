@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent-start-working",
+  "title": "AgentStartWorking",
+  "description": "Server → Vision Pro: Agent starts working",
+  "type": "object",
+  "required": ["type", "agent_id"],
+  "properties": {
+    "type": { "const": "agent_start_working", "description": "Message type" },
+    "agent_id": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9,
+      "description": "Agent id 1-9 (position in 3x3 grid)"
+    }
+  }
+}
