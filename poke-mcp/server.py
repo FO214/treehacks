@@ -10,6 +10,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 
@@ -31,6 +32,11 @@ mcp = FastMCP("TreeHacks Fix Agent")
 
 # Default repository for testing
 DEFAULT_REPO_URL = "https://github.com/soooooooot/treehacks-agent-repo"
+
+# If set, run_fix returns immediately and does sandbox/PR in a background thread.
+# Use this to avoid MCP client timeouts (ClientDisconnect) when the client gives up
+# before the long-running job finishes.
+RUN_FIX_IN_BACKGROUND = (os.environ.get("RUN_FIX_IN_BACKGROUND", "").strip().lower() in ("1", "true", "yes"))
 
 # System prompt: frames the task for fix/change flows (make the modification only,
 # the server handles branching/committing/PR automatically).
@@ -591,6 +597,27 @@ def run_fix(
     Returns:
         The PR URL, agent output, and optional smoke test results
     """
+    if RUN_FIX_IN_BACKGROUND:
+        def _run():
+            try:
+                run_modal_agent(
+                    instruction=instruction,
+                    repo_url=repo_url,
+                    system_prompt=FIX_SYSTEM_PROMPT,
+                    smoke_test=smoke_test,
+                    start_command=start_command or None,
+                    app_port=app_port,
+                )
+            except Exception:
+                pass  # background; no way to return result to client
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        return (
+            "Job started in background. Sandbox will run, branch will be pushed, and PR opened. "
+            "This usually takes 2–5 minutes. Set RUN_FIX_IN_BACKGROUND=0 to wait for the result (may hit client timeout)."
+        )
+
     try:
         result = run_modal_agent(
             instruction=instruction,
@@ -617,6 +644,22 @@ def run_fix_default_repo(instruction: str, smoke_test: bool = False) -> str:
     Returns:
         The PR URL, agent output, and optional smoke test results
     """
+    if RUN_FIX_IN_BACKGROUND:
+        def _run():
+            try:
+                run_modal_agent(
+                    instruction=instruction,
+                    repo_url=DEFAULT_REPO_URL,
+                    system_prompt=FIX_SYSTEM_PROMPT,
+                    smoke_test=smoke_test,
+                )
+            except Exception:
+                pass
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        return "Job started in background (default repo). PR will be opened in a few minutes."
+
     try:
         result = run_modal_agent(
             instruction=instruction,
