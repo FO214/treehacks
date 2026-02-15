@@ -55,6 +55,18 @@ async def call_run_fix(text_input: str, repo_url: str | None) -> str:
 
 app = FastAPI(title="Fix API", description="Accepts fix instruction, calls MCP server (Modal + Claude Agent SDK).")
 
+# Demo: Vision Pro block color (0 or 1). Toggles on each request for demo visibility.
+_demo_value = 0
+
+
+@app.get("/demo/value")
+async def get_demo_value() -> dict:
+    """Return value 0 or 1 for Vision Pro demo block color. Toggles each request."""
+    global _demo_value
+    val = _demo_value
+    _demo_value = 1 - _demo_value
+    return {"value": val}
+
 
 @app.post("/fix", response_class=PlainTextResponse)
 async def fix(request: FixRequest) -> str:

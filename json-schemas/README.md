@@ -16,3 +16,4 @@ Use these schemas to:
 | `diagram-request.json` | Request for repo → diagram generation |
 | `diagram-response.json` | Diagram PNG + component positions for spatial display in Vision Pro |
 | `agents.json` | List of agents and their status (coding, creating_pr, testing, etc.) |
+| `demo-value.json` | Demo: value 0 or 1 for Vision Pro block color (GET /demo/value) |
