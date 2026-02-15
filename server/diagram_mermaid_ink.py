@@ -134,6 +134,12 @@ def main() -> None:
         action="store_true",
         help="Fetch SVG and run SVG-based checker: print block positions (id, label, x, y).",
     )
+    parser.add_argument(
+        "-o", "--output",
+        dest="output_path",
+        default=None,
+        help="Save image to file (fetches from mermaid.ink URL).",
+    )
     args = parser.parse_args()
 
     if args.sample:
@@ -180,6 +186,13 @@ def main() -> None:
             print(f"  Failed to fetch/parse SVG: {e}", file=sys.stderr)
     else:
         print("\nOpen the URL above in a browser to view the diagram.")
+
+    if args.output_path:
+        print(f"\nFetching and saving to {args.output_path}...")
+        req = urllib.request.Request(image_url, headers={"User-Agent": "Mozilla/5.0 (compatible; diagram_mermaid_ink/1.0)"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            Path(args.output_path).write_bytes(resp.read())
+        print(f"Saved {args.output_path}")
 
 
 if __name__ == "__main__":
