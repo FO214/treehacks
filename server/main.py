@@ -96,14 +96,15 @@ async def fix(request: FixRequest) -> str:
 
 
 # ---------------------------------------------------------------------------
-# WebSocket: /ws/poke — Vision Pro ↔ server event bridge
+# WebSocket: /ws/poke — Vision Pro ↔ server voice event bridge
 # ---------------------------------------------------------------------------
 
 @app.websocket("/ws/poke")
 async def websocket_poke(websocket: WebSocket):
     """
-    Vision Pro connects here. Receives hand_open / hand_close gestures;
-    broadcasts listening, poke_speaking, and agent_update events back.
+    Vision Pro connects here for voice flow.
+    Receives hand_open / hand_close gestures;
+    broadcasts listening, poke_speaking events back.
     """
     await websocket.accept()
     event_bus.register(websocket)
@@ -143,15 +144,42 @@ async def websocket_poke(websocket: WebSocket):
             pass
 
 
+# ---------------------------------------------------------------------------
+# WebSocket: /ws/spawn — Vision Pro agent state stream
+# ---------------------------------------------------------------------------
+
+@app.websocket("/ws/spawn")
+async def websocket_spawn(websocket: WebSocket):
+    """
+    Vision Pro connects here for agent lifecycle events.
+    Server pushes: create_agent_thinking, agent_start_working, agent_start_testing.
+    """
+    await websocket.accept()
+    event_bus.register(websocket)
+    print("[ws/spawn] client connected")
+    try:
+        # This WS is server→client only; keep connection alive by reading
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        print("[ws/spawn] client disconnected")
+    except Exception:
+        pass
+    finally:
+        event_bus.unregister(websocket)
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
 @app.post("/internal/event")
 async def internal_event(body: dict):
     """
     Receives agent progress events from poke-mcp (cross-process webhook).
-    Broadcasts them to all connected WS clients.
+    Broadcasts them to all connected WS clients (both /ws/poke and /ws/spawn).
+    Event types: create_agent_thinking, agent_start_working, agent_start_testing.
     """
-    # Wrap in agent_update type if not already set
-    if "type" not in body:
-        body["type"] = "agent_update"
     await event_bus.broadcast(body)
     return {"ok": True}
 

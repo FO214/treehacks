@@ -58,7 +58,6 @@ def _next_agent_id() -> int:
 
 def _post_event(event: dict) -> None:
     """Fire-and-forget POST to the FastAPI event webhook."""
-    event.setdefault("type", "agent_update")
     payload = json.dumps(event).encode()
     headers = {"Content-Type": "application/json"}
     try:
@@ -559,7 +558,7 @@ def run_modal_agent(
     try:
         # ── Create sandbox ────────────────────────────────────────────
         print("[soot] Creating Modal sandbox...", flush=True)
-        _post_event({"agent_id": agent_id, "status": "thinking"})
+        _post_event({"type": "create_agent_thinking", "agent_id": agent_id, "task_name": instruction[:100]})
         sandbox_kwargs: dict = dict(app=app, image=sandbox_image, timeout=10 * 60)
         with modal.enable_output():
             sb = modal.Sandbox.create(**sandbox_kwargs)
@@ -600,7 +599,7 @@ def run_modal_agent(
             )
 
         print("[soot] Running claude-agent-sdk...", flush=True)
-        _post_event({"agent_id": agent_id, "status": "working"})
+        _post_event({"type": "agent_start_working", "agent_id": agent_id})
         agent_p = sb.exec(
             "python", "-c", AGENT_SCRIPT,
             workdir="/repo",
@@ -671,14 +670,16 @@ def run_modal_agent(
 
         # ── 7. (Optional) Smoke test via Browserbase + Vercel preview ──
         smoke_result = ""
+        vercel_url = ""
+        browserbase_url = ""
         if smoke_test:
-            _post_event({"agent_id": agent_id, "status": "testing"})
             try:
                 # Wait for Vercel bot to comment with the preview URL
                 pr_number = _extract_pr_number(pr_url)
                 preview_url = _wait_for_vercel_preview(
                     owner, repo_name, pr_number, github_token, timeout=300,
                 )
+                vercel_url = preview_url or ""
 
                 if preview_url:
                     print(f"[soot] Running Browserbase smoke test against {preview_url}...", flush=True)
@@ -697,6 +698,11 @@ def run_modal_agent(
                             instruction=instruction,
                         ).result()
                     print(f"[soot] {smoke_result}", flush=True)
+
+                    # Extract Browserbase replay URL from smoke result
+                    bb_match = re.search(r"https://browserbase\.com/sessions/[a-zA-Z0-9\-]+", smoke_result)
+                    if bb_match:
+                        browserbase_url = bb_match.group(0)
                 else:
                     smoke_result = "Smoke test skipped: Vercel preview deploy did not complete within 5 minutes."
                     print(f"[soot] {smoke_result}", flush=True)
@@ -705,38 +711,23 @@ def run_modal_agent(
                 smoke_result = f"Smoke test error: {e}"
                 print(f"[soot] {smoke_result}", flush=True)
 
+        # ── Emit agent_start_testing with URLs (final event for frontend) ──
+        _post_event({
+            "type": "agent_start_testing",
+            "agent_id": agent_id,
+            "vercel_link": vercel_url,
+            "browserbase_link": browserbase_url,
+        })
+
         result_parts = [f"PR created: {pr_url}", f"Branch: {branch_name}"]
         if smoke_result:
             result_parts.append(f"Smoke test: {smoke_result}")
         result_parts.append("")
         result_parts.append(agent_stdout)
-
-        # ── Emit "done" event with all URLs ──────────────────────────
-        done_event: dict = {
-            "agent_id": agent_id,
-            "status": "done",
-            "pr_url": pr_url,
-        }
-        # Parse smoke result for Vercel/Browserbase URLs and verdict
-        if smoke_result:
-            import re as _re
-            vercel_match = _re.search(r"https://[a-zA-Z0-9\-]+\.vercel\.app", smoke_result)
-            bb_match = _re.search(r"https://browserbase\.com/sessions/[a-zA-Z0-9\-]+", smoke_result)
-            if vercel_match:
-                done_event["vercel_url"] = vercel_match.group(0)
-            if bb_match:
-                done_event["browserbase_url"] = bb_match.group(0)
-            done_event["pass"] = "Passed" in smoke_result or "PASS" in smoke_result
-            # Extract verdict text after "Verdict: "
-            verdict_match = _re.search(r"Verdict:\s*(.+?)(?:\.|$)", smoke_result)
-            if verdict_match:
-                done_event["verdict"] = verdict_match.group(1).strip()
-        _post_event(done_event)
-
         return "\n".join(result_parts)
 
     except Exception as e:
-        _post_event({"agent_id": agent_id, "status": "error", "error_message": str(e)})
+        _post_event({"type": "agent_error", "agent_id": agent_id, "error_message": str(e)})
         return f"Error: {str(e)}"
 
     finally:
