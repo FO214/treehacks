@@ -1,0 +1,44 @@
+#usda 1.0
+(
+    customLayerData = {
+        string creator = "Reality Composer Pro Version 2.0 (494.60.2)"
+    }
+    defaultPrim = "Root"
+    metersPerUnit = 1
+    upAxis = "Y"
+)
+
+def Xform "Root"
+{
+    def RealityKitTimeline "Susuwatari_1" (
+        references = @0/Susuwatari.usdz@
+    )
+    {
+        def RealityKitTrack "Track"
+        {
+            def RealityKitAction "Animation"
+            {
+                string actionKind = "animation"
+                int blendLayer = 500
+                double duration = 1
+                uniform token info:id = "11BC6B94-5EAF-442F-A5E0-E2FD93B5B8C1"
+                bool separateAnimatedValue = 1
+                double startTime = 0
+
+                def RealityKitStruct "handoffType"
+                {
+                }
+            }
+        }
+    }
+
+    def "computerSpawn_1" (
+        active = true
+        prepend references = @0/computerSpawn.usdz@
+    )
+    {
+        float3 xformOp:scale = (1, 1, 1)
+        float3 xformOp:translate = (10.251934, 0, 161.7814)
+    }
+}
+

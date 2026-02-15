@@ -40,7 +40,7 @@ final class DemoBlockState {
     var palmTreeEntity: Entity?
     /// True while palm tree is mid-jump; ignores new jump_ping until done.
     var isPalmTreeJumping = false
-    /// Cached charc.usdc; cloned when spawning.
+    /// Cached Susuwatari.usdz; cloned when spawning.
     var characterTemplate: Entity?
     /// Cached thinking.usdz; shown above head when in thinking mode.
     var thinkingTemplate: Entity?
@@ -181,7 +181,7 @@ struct ImmersiveView: View {
 
             // Load templates and create 9 static desks (computer on desk)
             Task { @MainActor in
-                if let character = try? await Entity(named: "charc.usdc", in: realityKitContentBundle) {
+                if let character = try? await Entity(named: "Susuwatari_unpacked/susuwatari.usda", in: realityKitContentBundle) {
                     blockState.characterTemplate = character
                 }
                 if let thinking = try? await Entity(named: "thinking.usdz", in: realityKitContentBundle) {
@@ -596,16 +596,17 @@ struct ImmersiveView: View {
         let gridIndex = agentId - 1
         let gridPos = Self.gridPositions[gridIndex]
         let targetY = Self.targetBoundsSize / 2 + 1.2 - 0.5
+        let characterZOffset: Float = +1  // Z offset from grid (negative = towards user)
 
         // Container: no rotation; handles position and jump. Webview/thinking indicator stay world-aligned.
         let container = Entity()
         container.name = "character_\(agentId)"
-        container.position = [gridPos.x, targetY - 1.0, gridPos.z - 2.5]  // 1.5m closer towards user (was -1.0)
+        container.position = [gridPos.x, targetY - 1.0, gridPos.z + characterZOffset]
         root.addChild(container)
         blockState.characterEntities[agentId] = container
         blockState.agentStates[agentId] = targetState
 
-        // Char model: rotation applied only to the visual mesh, not to container children
+        // Char model: no transforms relative to table
         let charModel: Entity
         if let template = blockState.characterTemplate {
             charModel = template.clone(recursive: true)
@@ -615,11 +616,7 @@ struct ImmersiveView: View {
             charModel = Self.makePlaceholderDesk()
         }
         charModel.name = "char_model_\(agentId)"
-        charModel.position = [0, 0, 0]
-        let rotY = simd_quatf(angle: 90 * .pi / 180, axis: [0, 1, 0])
-        let rotZ = simd_quatf(angle: 180 * .pi / 180, axis: [0, 0, 1])
-        let rotZ90 = simd_quatf(angle: 90 * .pi / 180, axis: [0, 0, 1])  // 90° CCW on Z
-        charModel.orientation = rotY * rotZ * rotZ90
+        charModel.orientation = simd_quatf(angle: .pi, axis: [0, 1, 0])  // 180° around Y
         container.addChild(charModel)
 
         if targetState == .thinking {
@@ -643,7 +640,7 @@ struct ImmersiveView: View {
         }
 
         var targetTransform = container.transform
-        targetTransform.translation = [gridPos.x, targetY, gridPos.z - 2.5]  // 1.5m closer towards user
+        targetTransform.translation = [gridPos.x, targetY, gridPos.z + characterZOffset]
         container.move(to: targetTransform, relativeTo: root, duration: 0.6, timingFunction: .easeOut)
     }
 
@@ -673,6 +670,22 @@ struct ImmersiveView: View {
     }
 
     private func triggerRecordOnce() async {
+        // Only trigger when user is within 1m of the palm tree
+        guard let palmTree = blockState.palmTreeEntity,
+              let deviceAnchor = handTrackingManager.queryDeviceAnchor() else {
+            return
+        }
+        let palmTreeWorldPos = palmTree.position(relativeTo: nil)
+        let devicePos = SIMD3<Float>(
+            deviceAnchor.originFromAnchorTransform.columns.3.x,
+            deviceAnchor.originFromAnchorTransform.columns.3.y,
+            deviceAnchor.originFromAnchorTransform.columns.3.z
+        )
+        let distance = simd_distance(devicePos, palmTreeWorldPos)
+        if distance > 1.0 {
+            return  // Too far from palm tree
+        }
+
         // Call record-once (proxied via FastAPI to voice server)
         guard let url = URL(string: "\(APIConfig.baseURL)/record-once") else {
             print("[HandTracking] Invalid voice server URL")
