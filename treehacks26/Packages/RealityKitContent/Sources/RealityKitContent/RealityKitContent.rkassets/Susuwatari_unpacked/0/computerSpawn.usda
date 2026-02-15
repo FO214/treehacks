@@ -1,0 +1,71 @@
+#usda 1.0
+(
+    defaultPrim = "Ground"
+    metersPerUnit = 1
+    upAxis = "Y"
+)
+
+def Xform "Ground"
+{
+    reorder nameChildren = ["Susuwatari_thinking", "Susuwatari", "OfficeSetUp"]
+    float3 xformOp:translate = (0.1, 0.2, 0.060551643)
+    uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
+
+    def "Wood_Boss_Office_Table" (
+        active = true
+        references = @0/Wood_Boss_Office_Table.usdz@
+    )
+    {
+        float3 xformOp:scale = (0.01, 0.01, 0.01)
+        float3 xformOp:translate = (-0.1, -0.2, -0.060551643)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
+    }
+
+    def "Retro_computer" (
+        active = true
+        customData = {
+            float3 rotationEulerHint = (-0.022173643, -3.0487766, 0.0020551682)
+        }
+        references = @0/Retro_computer.usdz@
+    )
+    {
+        quatf xformOp:orient = (-0.046399843, -0.00051223533, 0.99886197, 0.011027027)
+        float3 xformOp:scale = (0.015, 0.015, 0.017)
+        float3 xformOp:translate = (-0.28982183, 0.8425179, 0.046782494)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
+    }
+
+    def RealityKitTimeline "OfficeSetUp"
+    {
+        reorder nameChildren = ["Track", "Track2"]
+        def RealityKitTrack "Track"
+        {
+            def RealityKitAction "Emphasize"
+            {
+                string actionKind = "emphasize"
+                int blendLayer = 300
+                double duration = 0.5625247231012658
+                uniform token info:id = "FB47FC5E-1E24-43D6-ABA6-12234C8C3A97"
+                token motionType = "float"
+                double startTime = 0
+                token style = "playful"
+                rel target = </Ground/Retro_computer/Meshes>
+            }
+        }
+    }
+
+    def Material "Material"
+    {
+        token outputs:mtlx:surface.connect = </Ground/Material/PreviewSurface.outputs:out>
+        token outputs:realitykit:vertex
+        float2 ui:nodegraph:realitykit:subgraphOutputs:pos = (335.25, 100.5)
+
+        def Shader "PreviewSurface"
+        {
+            uniform token info:id = "ND_UsdPreviewSurface_surfaceshader"
+            token outputs:out
+            float2 ui:nodegraph:node:pos = (93.5, 100.5)
+        }
+    }
+}
+

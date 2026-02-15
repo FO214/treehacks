@@ -22,12 +22,21 @@ struct treehacks26App: App {
                     .environment(appModel)
             }
         }
+        .windowResizability(.contentSize)
         .onChange(of: scenePhase) { _, newPhase in
             if newPhase == .background {
                 exit(0)
             }
         }
-        
+
+        WindowGroup("Vercel Preview") {
+            WebView(url: URL(string: "https://treehacks-agent-repo.vercel.app"))
+                .frame(minWidth: 600, minHeight: 450)
+                .glassBackgroundEffect(in: .rect(cornerRadius: 16))
+        }
+        .windowResizability(.contentSize)
+        .defaultSize(width: 600, height: 450)
+
         ImmersiveSpace(id: appModel.immersiveSpaceID) {
             ImmersiveView()
                 .environment(appModel)

@@ -9,10 +9,12 @@ import ARKit
 import RealityKitContent
 import UIKit
 
-/// Agent state machine: thinking → working → testing. Strict order; out-of-order messages ignored.
-/// - thinking: Character spawned, awaiting start_working
-/// - working: Awaiting agent_start_testing
-/// - testing: Webview shown, character persists until user closes
+/// Agent state machine: thinking → working → testing.
+/// Handles out-of-order messages: if a later-state message arrives before earlier ones,
+/// the character is spawned directly in that state.
+/// - thinking: Character spawned with thinking indicator, awaiting start_working
+/// - working: No thinking indicator, awaiting agent_start_testing
+/// - testing: Webview shown, character jumped up, persists until user closes
 enum AgentState: String {
     case thinking
     case working
@@ -36,15 +38,24 @@ final class DemoBlockState {
     var whiteboardEntity: Entity?
     /// Palm tree in corner of floor (for jump_ping animation).
     var palmTreeEntity: Entity?
-    /// Cached character.usdc; cloned when spawning.
+    /// True while palm tree is mid-jump; ignores new jump_ping until done.
+    var isPalmTreeJumping = false
+    /// Cached Susuwatari.usdz; cloned when spawning.
     var characterTemplate: Entity?
+    /// Cached thinking.usdz; shown above head when in thinking mode.
+    var thinkingTemplate: Entity?
     /// Cached computerSpawn_2.usdz; used for static desks.
     var computerDeskTemplate: Entity?
+    /// Thinking indicator entities per agent (child of character); shaken in update loop.
+    var thinkingIndicatorEntities: [Int: Entity] = [:]
+    /// 3D circle indicators on whiteboard for each running agent (agent_id -> Entity).
+    var whiteboardAgentIndicators: [Int: Entity] = [:]
     /// When true, root follows gaze (where user is looking) instead of hand.
     var isRepositioningMode = false
     /// True after we've placed root near user; avoids spawn at plane anchor center (often far away).
     var hasInitialPlacement = false
-
+    /// Previous palm state for repositioning (snap only on open transition).
+    var wasPalmOpenForReposition = false
     /// Debug: last WebSocket message received (shown on-screen).
     var lastWsMessage: String = ""
     /// Debug: WebSocket connection status.
@@ -54,6 +65,10 @@ final class DemoBlockState {
     func closeWebview(agentId: Int) {
         testingWebviewURLs.removeValue(forKey: agentId)
         webviewEntities[agentId]?.removeFromParent()
+        thinkingIndicatorEntities[agentId]?.removeFromParent()
+        thinkingIndicatorEntities.removeValue(forKey: agentId)
+        whiteboardAgentIndicators[agentId]?.removeFromParent()
+        whiteboardAgentIndicators.removeValue(forKey: agentId)
         characterEntities[agentId]?.removeFromParent()
         characterEntities.removeValue(forKey: agentId)
         agentStates.removeValue(forKey: agentId)
@@ -79,6 +94,8 @@ struct ImmersiveView: View {
     private static let deskTargetSize: Float = 0.15 * scaleFactor
     /// Character scale multiplier (characters need to be much larger to be visible).
     private static let characterScaleMultiplier: Float = 3
+    /// Character size reduction (0.7 = 30% smaller).
+    private static let characterSizeReduction: Float = 0.7
     /// Extra 2x scale for desks and characters only (not spacing).
     private static let deskAndCharacterSizeMultiplier: Float = 2
     private static let gridSpacing: Float = 0.12 * scaleFactor + 1
@@ -90,7 +107,7 @@ struct ImmersiveView: View {
         for row in 0..<gridCols {
             for col in 0..<gridCols {
                 positions.append([
-                    half - Float(col) * gridSpacing,  // flipped horizontal
+                    half - Float(col) * gridSpacing,  // horizontal (reversed)
                     targetBoundsSize / 2, // sit on floor
                     Float(row) * gridSpacing - half
                 ])
@@ -130,27 +147,27 @@ struct ImmersiveView: View {
                     whiteboard.name = "whiteboard"
                     whiteboard.position = [0, 0.5 * Self.scaleFactor - 2, -0.3 * Self.scaleFactor]  // 2m lower, in front of origin
                     anchor.addChild(whiteboard)
-                    Self.scaleToBoundsSize(whiteboard, targetSize: Self.targetBoundsSize * 15 / 4)  // 1/4 size
+                    Self.scaleToBoundsSize(whiteboard, targetSize: Self.targetBoundsSize * 15 / 2)  // 2x size (was 15/4)
                     blockState.whiteboardEntity = whiteboard
+                }
 
-                    // Diagram from project root (diagram.svg → diagram.png), snapped to front of whiteboard
-                    let loadDiagram = true
-                    if loadDiagram {
-                        do {
-                            let texture: TextureResource?
-                            if let url = Bundle.main.url(forResource: "diagram", withExtension: "png") {
-                                texture = try await TextureResource.load(contentsOf: url)
-                            } else {
-                                texture = try? await TextureResource.load(named: "diagram", in: .main)
-                            }
-                            if let texture, let diagramPlane = Self.makeDiagramPlane(texture: texture) {
-                                diagramPlane.name = "diagram"
-                                diagramPlane.position = [0, 0, 0.02 * Self.scaleFactor]  // Slightly in front of whiteboard face
-                                whiteboard.addChild(diagramPlane)
-                            }
-                        } catch {
-                            print("[ImmersiveView] Diagram texture load failed: \(error)")
+                // Diagram plane: separate object slightly closer to user than whiteboard (z=-0.15 vs whiteboard z=-0.3)
+                let loadDiagram = true
+                if loadDiagram {
+                    do {
+                        let texture: TextureResource?
+                        if let url = Bundle.main.url(forResource: "diagram", withExtension: "png") {
+                            texture = try await TextureResource.load(contentsOf: url)
+                        } else {
+                            texture = try? await TextureResource.load(named: "diagram", in: .main)
                         }
+                        if let texture, let diagramPlane = Self.makeDiagramPlane(texture: texture) {
+                            diagramPlane.name = "diagram"
+                            diagramPlane.position = [0, 0.5 * Self.scaleFactor - 2, -0.15 * Self.scaleFactor - 1.85]  // 1.85m closer to whiteboard (+25cm)
+                            anchor.addChild(diagramPlane)
+                        }
+                    } catch {
+                        print("[ImmersiveView] Diagram texture load failed: \(error)")
                     }
                 }
             }
@@ -168,8 +185,11 @@ struct ImmersiveView: View {
 
             // Load templates and create 9 static desks (computer on desk)
             Task { @MainActor in
-                if let character = try? await Entity(named: "char.usdc", in: realityKitContentBundle) {
+                if let character = try? await Entity(named: "Susuwatari_unpacked/susuwatari.usda", in: realityKitContentBundle) {
                     blockState.characterTemplate = character
+                }
+                if let thinking = try? await Entity(named: "thinking.usdz", in: realityKitContentBundle) {
+                    blockState.thinkingTemplate = thinking
                 }
                 if let computer = try? await Entity(named: "computerSpawn_2.usdz", in: realityKitContentBundle),
                    let root = blockState.rootEntity {
@@ -184,8 +204,14 @@ struct ImmersiveView: View {
                         Self.scaleToBoundsSize(desk, targetSize: Self.targetBoundsSize * Self.deskAndCharacterSizeMultiplier)
                     }
 
-                    // Palm tree: same x,z as first desk, base on floor (y=0)
+                    // Palm tree: 2m further from grid center than first desk
                     let gridPos0 = Self.gridPositions[0]
+                    let epicenterOffset: Float = 2.0
+                    let xz = SIMD2<Float>(gridPos0.x, gridPos0.z)
+                    let dist = simd_length(xz)
+                    let palmXZ: SIMD2<Float> = dist > 0.001
+                        ? xz + epicenterOffset * (xz / dist)
+                        : xz + [epicenterOffset, 0]  // fallback if at center
                     let deskTargetSize = Self.targetBoundsSize * Self.deskAndCharacterSizeMultiplier
                     let palmTree: Entity
                     if let model = try? await Entity(named: "palmtreelowpolygon.usdz", in: realityKitContentBundle) {
@@ -198,9 +224,28 @@ struct ImmersiveView: View {
                     palmTree.name = "palm_tree"
                     // Floor is at y=0; put base on floor (center at half-height for origin-at-center models)
                     let palmHalfHeight = deskTargetSize / 2
-                    palmTree.position = [gridPos0.x, palmHalfHeight, gridPos0.z]
+                    palmTree.position = [palmXZ.x, palmHalfHeight, palmXZ.y]
+                    // Touch detection: CollisionComponent + InputTargetComponent
+                    let collisionShape = ShapeResource.generateBox(size: [deskTargetSize, deskTargetSize, deskTargetSize])
+                    palmTree.components.set([
+                        CollisionComponent(shapes: [collisionShape]),
+                        InputTargetComponent(),
+                    ])
                     root.addChild(palmTree)
                     blockState.palmTreeEntity = palmTree
+
+                    // Record button: large interactive button 2.5m off ground at tree, sends record-once on tap
+                    let recordButton = ModelEntity(
+                        mesh: MeshResource.generateBox(width: 0.6, height: 0.15, depth: 0.6),
+                        materials: [SimpleMaterial(color: .systemBlue, isMetallic: false)]
+                    )
+                    recordButton.name = "record_button"
+                    recordButton.position = [palmXZ.x, 2.5, palmXZ.y]
+                    recordButton.components.set([
+                        CollisionComponent(shapes: [ShapeResource.generateBox(width: 0.6, height: 0.15, depth: 0.6)]),
+                        InputTargetComponent(),
+                    ])
+                    root.addChild(recordButton)
                 }
             }
 
@@ -208,35 +253,52 @@ struct ImmersiveView: View {
             // SceneEvents.Update may run off main thread; HandTrackingManager is @MainActor
             updateSubscription = content.subscribe(to: SceneEvents.Update.self) { _ in
                 Task { @MainActor in
-                    guard let planeAnchor = blockState.planeAnchor else { return }
+                    syncWhiteboardIndicators()
+
+                    // Shake thinking indicators
+                    let t = Float(ProcessInfo.processInfo.systemUptime)
+                    for (_, entity) in blockState.thinkingIndicatorEntities {
+                        let shakeX = sin(t * 12) * 0.06
+                        let shakeZ = sin(t * 10 + 1) * 0.06
+                        let rotX = simd_quatf(angle: shakeX, axis: [1, 0, 0])
+                        let rotZ = simd_quatf(angle: shakeZ, axis: [0, 0, 1])
+                        entity.orientation = rotZ * rotX
+                    }
+
+                    guard let planeAnchor = blockState.planeAnchor,
+                          let root = blockState.rootEntity else { return }
 
                     if let deviceAnchor = handTrackingManager.queryDeviceAnchor() {
-                        // Device tracking: 45cm in front of user on the surface
                         let t = deviceAnchor.originFromAnchorTransform
                         let devicePos = SIMD3<Float>(t.columns.3.x, t.columns.3.y, t.columns.3.z)
-                        let forward = SIMD3<Float>(-t.columns.2.x, -t.columns.2.y, -t.columns.2.z)
+                        let forward = SIMD3<Float>(t.columns.2.x, t.columns.2.y, t.columns.2.z)
                         let horizontalForward = simd_normalize(SIMD3<Float>(forward.x, 0, forward.z))
 
                         if simd_length(horizontalForward) > 0.1 {
-                            // Place center of grid directly in front of user (2m), not at corner
                             let distanceInFront: Float = 2.0
                             let pointInFront = devicePos + horizontalForward * distanceInFront
                             let surfaceY = planeAnchor.position(relativeTo: nil).y
                             let hitWorld = SIMD3<Float>(pointInFront.x, surfaceY, pointInFront.z)
+                            let localPos = planeAnchor.convert(position: hitWorld, from: nil)
+                            let middleChildCenterOffset: Float = Self.targetBoundsSize / 2
+                            let snapPosition = SIMD3<Float>(localPos.x, localPos.y - middleChildCenterOffset, localPos.z)
 
-                            // Root: only when initial placement or repositioning (palm open)
-                            let shouldUpdateRoot = !blockState.hasInitialPlacement
-                                || (blockState.isRepositioningMode && handTrackingManager.isPalmCurrentlyOpen())
-                            if shouldUpdateRoot, let root = blockState.rootEntity {
-                                let localPos = planeAnchor.convert(position: hitWorld, from: nil)
-                                let middleChildCenterOffset: Float = Self.targetBoundsSize / 2
-                                root.position = SIMD3<Float>(localPos.x, localPos.y - middleChildCenterOffset, localPos.z)
+                            if !blockState.hasInitialPlacement {
+                                // Initial placement: snap to 2m in front on surface
+                                root.position = snapPosition
                                 blockState.hasInitialPlacement = true
+                            } else if blockState.isRepositioningMode {
+                                let palmOpen = handTrackingManager.isPalmCurrentlyOpen()
+                                if palmOpen, !blockState.wasPalmOpenForReposition {
+                                    // Palm just opened: snap to surface in front
+                                    root.position = snapPosition
+                                }
+                                blockState.wasPalmOpenForReposition = palmOpen
                             }
                         }
                     } else {
                         // Simulator or no tracking
-                        if let root = blockState.rootEntity {
+                        if let root = blockState.rootEntity, let planeAnchor = blockState.planeAnchor {
                             root.position = [0, 0, -0.5 * Self.scaleFactor]
                             blockState.hasInitialPlacement = true
                         }
@@ -257,6 +319,20 @@ struct ImmersiveView: View {
                 }
             }
         }
+        .gesture(
+            TapGesture()
+                .targetedToAnyEntity()
+                .onEnded { value in
+                    if value.entity.name == "palm_tree" {
+                        Task { @MainActor in
+                            await handleJumpPing()
+                            postPalmTouched()
+                        }
+                    } else if value.entity.name == "record_button" {
+                        postRecordOnce()
+                    }
+                }
+        )
 
             // Overlay: show when root is searching for a surface to latch to
             if !blockState.hasInitialPlacement {
@@ -296,6 +372,7 @@ struct ImmersiveView: View {
         .onChange(of: appModel.repositioningMode) { _, newValue in
             blockState.isRepositioningMode = newValue
             handTrackingManager.isRepositioningMode = newValue
+            blockState.wasPalmOpenForReposition = false
         }
         .onAppear {
             blockState.isRepositioningMode = appModel.repositioningMode
@@ -326,23 +403,28 @@ struct ImmersiveView: View {
             blockState.rootEntity = nil
             blockState.characterEntities = [:]
             blockState.agentStates = [:]
+            blockState.thinkingIndicatorEntities = [:]
+            blockState.whiteboardAgentIndicators = [:]
             blockState.testingWebviewURLs = [:]
             blockState.webviewEntities = [:]
             blockState.planeAnchor = nil
             blockState.whiteboardEntity = nil
             blockState.palmTreeEntity = nil
+            blockState.isPalmTreeJumping = false
             blockState.characterTemplate = nil
+            blockState.thinkingTemplate = nil
             blockState.computerDeskTemplate = nil
             blockState.hasInitialPlacement = false
+            blockState.wasPalmOpenForReposition = false
             blockState.wsConnected = false
             blockState.lastWsMessage = ""
         }
     }
 
-    /// Creates a plane with diagram texture for the whiteboard front (aspect ~3.22:1 from diagram.svg).
+    /// Creates a plane with diagram texture for the whiteboard front (16:9 aspect, half size).
     private static func makeDiagramPlane(texture: TextureResource) -> ModelEntity? {
-        let width: Float = 0.8 * Self.scaleFactor
-        let height: Float = 0.25 * Self.scaleFactor  // ~3.22:1 aspect
+        let width: Float = 0.4 * Self.scaleFactor   // Half of original
+        let height: Float = width * 9 / 16         // 16:9 aspect ratio
         let mesh = MeshResource.generatePlane(width: width, height: height)
         var mat = SimpleMaterial()
         mat.color = .init(tint: .white, texture: .init(texture))
@@ -361,6 +443,74 @@ struct ImmersiveView: View {
         let mesh = MeshResource.generateCylinder(height: 1.0, radius: 0.1)
         let mat = SimpleMaterial(color: .systemGreen, isMetallic: false)
         return ModelEntity(mesh: mesh, materials: [mat])
+    }
+
+    /// Placeholder thinking indicator (yellow sphere) when thinking.usdz is not available.
+    private static func makeThinkingPlaceholder() -> Entity {
+        let size: Float = 0.08 * Self.scaleFactor
+        let mesh = MeshResource.generateSphere(radius: size / 2)
+        let mat = SimpleMaterial(color: .systemYellow, isMetallic: false)
+        return ModelEntity(mesh: mesh, materials: [mat])
+    }
+
+    /// Color for whiteboard agent indicator by agent ID (1-9).
+    private static func colorForAgentId(_ agentId: Int) -> UIColor {
+        switch agentId {
+        case 1: return .systemRed
+        case 2: return .systemOrange
+        case 3: return .systemYellow
+        case 4: return .systemGreen
+        case 5: return .systemTeal
+        case 6: return .systemBlue
+        case 7: return .systemPurple
+        case 8: return .systemPink
+        case 9: return .systemIndigo
+        default: return .systemGray
+        }
+    }
+
+    /// Creates a flat 3D circle (thin cylinder) for whiteboard agent indicator.
+    private static func makeAgentCircleIndicator(agentId: Int) -> Entity {
+        let radius: Float = 0.025 * Self.scaleFactor
+        let height: Float = 0.002 * Self.scaleFactor  // Very thin disk
+        let mesh = MeshResource.generateCylinder(height: height, radius: radius)
+        let mat = SimpleMaterial(color: Self.colorForAgentId(agentId), isMetallic: false)
+        let entity = ModelEntity(mesh: mesh, materials: [mat])
+        entity.name = "whiteboard_indicator_\(agentId)"
+        // Rotate so flat face is in XY (facing user); cylinder default axis is Y
+        entity.orientation = simd_quatf(angle: .pi / 2, axis: [1, 0, 0])
+        return entity
+    }
+
+    /// Syncs whiteboard circle indicators with running agents. Call when characterEntities changes.
+    private func syncWhiteboardIndicators() {
+        guard let whiteboard = blockState.whiteboardEntity else { return }
+        let runningIds = Set(blockState.characterEntities.keys)
+
+        // Remove indicators for agents no longer running
+        let toRemove = blockState.whiteboardAgentIndicators.keys.filter { !runningIds.contains($0) }
+        for agentId in toRemove {
+            blockState.whiteboardAgentIndicators[agentId]?.removeFromParent()
+            blockState.whiteboardAgentIndicators.removeValue(forKey: agentId)
+        }
+
+        // Add indicators for newly running agents
+        let circleSpacing: Float = 0.06 * Self.scaleFactor
+        let gridOriginX: Float = 0.35 * Self.scaleFactor  // Right of diagram center
+        for agentId in runningIds {
+            if blockState.whiteboardAgentIndicators[agentId] == nil {
+                let circle = Self.makeAgentCircleIndicator(agentId: agentId)
+                let col = (agentId - 1) % 3
+                let row = (agentId - 1) / 3
+                circle.position = [
+                    gridOriginX + (Float(col) - 1) * circleSpacing,
+                    (Float(row) - 1) * circleSpacing,
+                    0.02 * Self.scaleFactor  // In front of whiteboard face
+                ]
+                whiteboard.addChild(circle)
+                blockState.whiteboardAgentIndicators[agentId] = circle
+            }
+        }
     }
 
     /// Scales an entity so its visual bounding box fits within a cube of the given size.
@@ -406,9 +556,7 @@ struct ImmersiveView: View {
                         if let data = text.data(using: .utf8),
                            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                            let type = json["type"] as? String {
-                            if type == "jump_ping" {
-                                await handleJumpPing()
-                            } else if let agentId = json["agent_id"] as? Int, (1...9).contains(agentId) {
+                            if let agentId = json["agent_id"] as? Int, (1...9).contains(agentId) {
                                 switch type {
                                 case "create_agent_thinking":
                                     await handleCreateAgentThinking(agentId: agentId, taskName: json["task_name"] as? String ?? "")
@@ -441,45 +589,25 @@ struct ImmersiveView: View {
 
     private func handleCreateAgentThinking(agentId: Int, taskName: String) async {
         await MainActor.run {
-            guard let root = blockState.rootEntity else { return }
-
-            // Full reset of slot: remove character, webview, and state (idempotent)
-            blockState.testingWebviewURLs.removeValue(forKey: agentId)
-            blockState.webviewEntities[agentId]?.removeFromParent()
-            blockState.agentStates.removeValue(forKey: agentId)
-            if let existing = blockState.characterEntities[agentId] {
-                existing.removeFromParent()
-                blockState.characterEntities.removeValue(forKey: agentId)
-            }
-
-            let gridIndex = agentId - 1
-            let character: Entity
-            if let template = blockState.characterTemplate {
-                character = template.clone(recursive: true)
-                let baseSize = Self.deskTargetSize * Self.characterScaleMultiplier * Self.deskAndCharacterSizeMultiplier
-                Self.scaleToBoundsSize(character, targetSize: baseSize / 4)
-            } else {
-                character = Self.makePlaceholderDesk()
-            }
-            character.name = "character_\(agentId)"
-            character.orientation = simd_quatf(angle: 70 * .pi / 180, axis: [0, 1, 0])
-            let gridPos = Self.gridPositions[gridIndex]
-            let targetY = Self.targetBoundsSize / 2 + 1.2 - 0.5
-            // Start 1m below, then smooth jump up to final position
-            character.position = [gridPos.x, targetY - 1.0, gridPos.z - 1.0]
-            root.addChild(character)
-            blockState.characterEntities[agentId] = character
-            blockState.agentStates[agentId] = .thinking
-
-            var targetTransform = character.transform
-            targetTransform.translation = [gridPos.x, targetY, gridPos.z - 1.0]
-            character.move(to: targetTransform, relativeTo: root, duration: 0.6, timingFunction: .easeOut)
+            spawnOrResetCharacter(agentId: agentId, targetState: .thinking)
         }
+    }
+
+    private func postPalmTouched() {
+        guard let url = URL(string: "\(APIConfig.baseURL)/palm-touched") else { return }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = "{\"type\":\"jump_ping\"}".data(using: .utf8)
+        URLSession.shared.dataTask(with: request) { _, _, _ in }.resume()
     }
 
     private func handleJumpPing() async {
         await MainActor.run {
+            guard !blockState.isPalmTreeJumping else { return }  // Ignore if already jumping
             guard let palmTree = blockState.palmTreeEntity, let parent = palmTree.parent else { return }
+            blockState.isPalmTreeJumping = true
+
             let jumpHeight: Float = 0.5
             let duration: TimeInterval = 0.25
 
@@ -492,15 +620,26 @@ struct ImmersiveView: View {
                 var downTransform = palmTree.transform
                 downTransform.translation.y -= jumpHeight
                 palmTree.move(to: downTransform, relativeTo: parent, duration: duration, timingFunction: .easeIn)
+                try? await Task.sleep(for: .seconds(duration))
+                blockState.isPalmTreeJumping = false  // Ready for next jump
             }
         }
     }
 
     private func handleAgentStartWorking(agentId: Int) async {
         await MainActor.run {
-            guard blockState.agentStates[agentId] == .thinking,
-                  blockState.characterEntities[agentId] != nil else { return }
-            blockState.agentStates[agentId] = .working
+            if let character = blockState.characterEntities[agentId] {
+                // Character exists: transition thinking → working (remove thinking indicator)
+                if blockState.agentStates[agentId] == .thinking {
+                    blockState.thinkingIndicatorEntities[agentId]?.removeFromParent()
+                    blockState.thinkingIndicatorEntities.removeValue(forKey: agentId)
+                    blockState.agentStates[agentId] = .working
+                }
+                // Already working or testing: no-op
+            } else {
+                // No character: spawn directly in working state (e.g. missed create_agent_thinking)
+                spawnOrResetCharacter(agentId: agentId, targetState: .working)
+            }
         }
     }
 
@@ -518,21 +657,90 @@ struct ImmersiveView: View {
                 webviewEntity.position = [0, 1.0, 1.0]  // 1m above character, 1m forward (Z)
                 character.addChild(webviewEntity)
             }
-
-            // Smooth jump 1m upward; webview stays child of character, both persist until user closes
-            let currentTransform = character.transform
-            var targetTransform = currentTransform
-            targetTransform.translation.y += 1.0  // 1m up
-
-            character.move(to: targetTransform, relativeTo: character.parent, duration: 0.8, timingFunction: .easeOut)
         }
     }
 
-    private func setupHandTracking() {
-        handTrackingManager.onOpenPalmDetected = {
-            await triggerRecordOnce()
+    /// Spawns or resets a character in the given state. Handles out-of-order messages.
+    private func spawnOrResetCharacter(agentId: Int, targetState: AgentState, vercelLink: String = "") {
+        guard let root = blockState.rootEntity else { return }
+
+        // Full reset of slot (idempotent)
+        blockState.testingWebviewURLs.removeValue(forKey: agentId)
+        blockState.webviewEntities[agentId]?.removeFromParent()
+        blockState.thinkingIndicatorEntities[agentId]?.removeFromParent()
+        blockState.thinkingIndicatorEntities.removeValue(forKey: agentId)
+        blockState.agentStates.removeValue(forKey: agentId)
+        if let existing = blockState.characterEntities[agentId] {
+            existing.removeFromParent()
+            blockState.characterEntities.removeValue(forKey: agentId)
         }
 
+        let gridIndex = agentId - 1
+        let gridPos = Self.gridPositions[gridIndex]
+        let targetY = Self.targetBoundsSize / 2 + 1.2 - 0.5
+        let characterZOffset: Float = +1  // Z offset from grid (negative = towards user)
+
+        // Container: no rotation; handles position and jump. Webview/thinking indicator stay world-aligned.
+        let container = Entity()
+        container.name = "character_\(agentId)"
+        container.position = [gridPos.x, targetY - 1.0, gridPos.z + characterZOffset]
+        root.addChild(container)
+        blockState.characterEntities[agentId] = container
+        blockState.agentStates[agentId] = targetState
+
+        // Char model: no transforms relative to table
+        let charModel: Entity
+        if let template = blockState.characterTemplate {
+            charModel = template.clone(recursive: true)
+            let baseSize = Self.deskTargetSize * Self.characterScaleMultiplier * Self.deskAndCharacterSizeMultiplier
+            Self.scaleToBoundsSize(charModel, targetSize: baseSize / 4 * Self.characterSizeReduction)
+        } else {
+            charModel = Self.makePlaceholderDesk()
+        }
+        charModel.name = "char_model_\(agentId)"
+        charModel.orientation = simd_quatf(angle: .pi, axis: [0, 1, 0])  // 180° around Y
+        container.addChild(charModel)
+
+        if targetState == .thinking {
+            let thinkingIndicator: Entity
+            if let template = blockState.thinkingTemplate {
+                thinkingIndicator = template.clone(recursive: true)
+                Self.scaleToBoundsSize(thinkingIndicator, targetSize: Self.targetBoundsSize * 0.8)
+            } else {
+                thinkingIndicator = Self.makeThinkingPlaceholder()
+                Self.scaleToBoundsSize(thinkingIndicator, targetSize: Self.targetBoundsSize * 0.8)
+            }
+            thinkingIndicator.name = "thinking_\(agentId)"
+            thinkingIndicator.position = [0, 0.25, 0]
+            container.addChild(thinkingIndicator)
+            blockState.thinkingIndicatorEntities[agentId] = thinkingIndicator
+        }
+
+        if targetState == .testing {
+            blockState.testingWebviewURLs[agentId] = vercelLink.isEmpty ? "https://www.google.com" : vercelLink
+            applyTestingState(container: container, agentId: agentId)
+        }
+
+        var targetTransform = container.transform
+        targetTransform.translation = [gridPos.x, targetY, gridPos.z + characterZOffset]
+        container.move(to: targetTransform, relativeTo: root, duration: 0.6, timingFunction: .easeOut)
+
+        syncWhiteboardIndicators()
+    }
+
+    /// Attaches webview and jumps container up; used when entering testing state.
+    private func applyTestingState(container: Entity, agentId: Int) {
+        if let webviewEntity = blockState.webviewEntities[agentId] {
+            webviewEntity.removeFromParent()
+            webviewEntity.position = [0, 1.0, 1.0]
+            container.addChild(webviewEntity)
+        }
+        var targetTransform = container.transform
+        targetTransform.translation.y += 1.0
+        container.move(to: targetTransform, relativeTo: container.parent, duration: 0.8, timingFunction: .easeOut)
+    }
+
+    private func setupHandTracking() {
         // Repositioning is now gaze-based (see SceneEvents.Update subscription)
         handTrackingManager.onOpenPalmForDrag = { _ in }
 
@@ -541,30 +749,22 @@ struct ImmersiveView: View {
         }
     }
 
-    private func triggerRecordOnce() async {
-        // Call record-once (proxied via FastAPI to voice server)
+    private func postRecordOnce() {
         guard let url = URL(string: "\(APIConfig.baseURL)/record-once") else {
-            print("[HandTracking] Invalid voice server URL")
+            print("[Record] Invalid voice server URL")
             return
         }
-
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.timeoutInterval = 15
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = "{}".data(using: .utf8)
-
-        do {
-            let (data, response) = try await URLSession.shared.data(for: request)
+        URLSession.shared.dataTask(with: request) { _, response, error in
             if let httpResponse = response as? HTTPURLResponse {
-                print("[HandTracking] record-once response: \(httpResponse.statusCode)")
+                print("[Record] record-once response: \(httpResponse.statusCode)")
             }
-            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                print("[HandTracking] record-once result: \(json)")
-            }
-        } catch {
-            print("[HandTracking] record-once failed: \(error)")
-        }
+            if let error { print("[Record] record-once failed: \(error)") }
+        }.resume()
     }
 }
 

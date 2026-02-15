@@ -23,6 +23,22 @@ from pydantic import BaseModel
 from . import voice
 from . import event_bus
 
+# ---------------------------------------------------------------------------
+# Atomic agent ID counter (1-9, wrapping). Owned by the main server.
+# ---------------------------------------------------------------------------
+import threading
+
+_agent_id_counter = 0
+_agent_id_lock = threading.Lock()
+
+
+def _next_agent_id() -> int:
+    """Return the next agent ID (1-9, wrapping). First call after startup returns 1."""
+    global _agent_id_counter
+    with _agent_id_lock:
+        _agent_id_counter = (_agent_id_counter % 9) + 1
+        return _agent_id_counter
+
 
 class FixRequest(BaseModel):
     text_input: str
@@ -164,6 +180,17 @@ async def internal_event(body: dict):
     return {"ok": True}
 
 
+@app.post("/internal/next-agent-id")
+async def next_agent_id():
+    """
+    Returns the next agent ID (1-9, wrapping).
+    Called by poke-mcp to get a unique agent ID for each new job.
+    """
+    agent_id = _next_agent_id()
+    print(f"[internal/next-agent-id] → returning agent_id={agent_id}")
+    return {"agent_id": agent_id}
+
+
 # ---------------------------------------------------------------------------
 # Demo: Vision Pro block color (WebSocket rainbow)
 # ---------------------------------------------------------------------------
@@ -206,14 +233,66 @@ async def websocket_demo(websocket: WebSocket):
             pass
 
 
+async def _ws_send_jump_ping(websocket: WebSocket) -> None:
+    """Send jump_ping every 2 seconds to make the palm tree jump."""
+    print("[ws/spawn] jump_ping loop started", flush=True)
+    while True:
+        msg = {"type": "jump_ping"}
+        payload = _json.dumps(msg)
+        print(f"[ws/spawn] → send: {payload}", flush=True)
+        await websocket.send_text(payload)
+        await asyncio.sleep(2.0)
+
+
+async def _ws_send_agent_cycle(websocket: WebSocket) -> None:
+    """Send agent lifecycle messages: create_agent_thinking → agent_start_working → agent_start_testing.
+    Cycles through agents 1-9 for each phase.
+    """
+    print("[ws/spawn] agent_cycle loop started", flush=True)
+    while True:
+        # Phase 1: create_agent_thinking for each agent 1-9
+        for agent_id in range(1, 10):
+            msg = {
+                "type": "create_agent_thinking",
+                "agent_id": agent_id,
+                "task_name": "placeholder task",
+            }
+            payload = _json.dumps(msg)
+            print(f"[ws/spawn] → send: {payload[:80]}…", flush=True)
+            await websocket.send_text(payload)
+            await asyncio.sleep(0.5)
+        # Phase 2: agent_start_working for each agent 1-9
+        for agent_id in range(1, 10):
+            msg = {"type": "agent_start_working", "agent_id": agent_id}
+            payload = _json.dumps(msg)
+            print(f"[ws/spawn] → send: {payload}", flush=True)
+            await websocket.send_text(payload)
+            await asyncio.sleep(0.5)
+        # Phase 3: agent_start_testing for each agent 1-9
+        for agent_id in range(1, 10):
+            msg = {
+                "type": "agent_start_testing",
+                "agent_id": agent_id,
+                "vercel_link": "https://google.com",
+                "browserbase_link": "https://google.com",
+            }
+            payload = _json.dumps(msg)
+            print(f"[ws/spawn] → send: {payload[:80]}…", flush=True)
+            await websocket.send_text(payload)
+            await asyncio.sleep(0.5)
+        await asyncio.sleep(2.0)  # Pause before next cycle
+
+
 @app.websocket("/ws/spawn")
 async def websocket_spawn(websocket: WebSocket):
-    """Vision Pro connects here. Only real events from /internal/event (poke-mcp webhook) are forwarded; no debug cycle."""
+    """Stream agent lifecycle messages and jump_ping to Vision Pro (DEBUG mode)."""
     await websocket.accept()
-    event_bus.register(websocket)
+    print("[ws/spawn] client connected — starting debug cycle + jump_ping", flush=True)
     try:
-        while True:
-            await websocket.receive_text()
+        await asyncio.gather(
+            _ws_send_agent_cycle(websocket),
+            _ws_send_jump_ping(websocket),
+        )
     except Exception:
         pass
     finally:

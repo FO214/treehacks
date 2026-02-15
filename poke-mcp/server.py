@@ -54,18 +54,20 @@ def _get_run_fix_semaphore() -> asyncio.Semaphore:
 # Event webhook: POST agent progress events to FastAPI /internal/event
 # ---------------------------------------------------------------------------
 EVENT_WEBHOOK_URL = os.environ.get("EVENT_WEBHOOK_URL", "http://localhost:8000/internal/event")
-
-# Atomic agent ID counter (1-9, wrapping)
-_agent_id_counter = 0
-_agent_id_lock = threading.Lock()
+NEXT_AGENT_ID_URL = os.environ.get("NEXT_AGENT_ID_URL", "http://localhost:8000/internal/next-agent-id")
 
 
 def _next_agent_id() -> int:
-    """Return the next agent ID (1-9, wrapping)."""
-    global _agent_id_counter
-    with _agent_id_lock:
-        _agent_id_counter = (_agent_id_counter % 9) + 1
-        return _agent_id_counter
+    """Fetch the next agent ID (1-9, wrapping) from the main server."""
+    try:
+        req = urllib.request.Request(NEXT_AGENT_ID_URL, method="POST")
+        req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+            return data.get("agent_id", 1)
+    except Exception as e:
+        print(f"[soot] Failed to get next agent ID from server: {e}", flush=True)
+        return 1  # fallback
 
 
 def _post_event(event: dict) -> None:
