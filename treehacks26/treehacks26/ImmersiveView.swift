@@ -89,8 +89,7 @@ struct ImmersiveView: View {
     }
 
     private func receiveColor() {
-        wsTask?.receive { [weak self] result in
-            guard let self else { return }
+        wsTask?.receive { result in
             switch result {
             case .success(let message):
                 switch message {
