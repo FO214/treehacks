@@ -5,6 +5,7 @@ Exposes the Modal + Claude Agent SDK functionality via FastMCP tools.
 After the agent applies a fix, the server automatically creates a branch,
 commits, pushes, and opens a GitHub pull request.
 """
+import asyncio
 import json
 import os
 import re
@@ -37,6 +38,17 @@ DEFAULT_REPO_URL = "https://github.com/soooooooot/treehacks-agent-repo"
 # Use this to avoid MCP client timeouts (ClientDisconnect) when the client gives up
 # before the long-running job finishes.
 RUN_FIX_IN_BACKGROUND = (os.environ.get("RUN_FIX_IN_BACKGROUND", "").strip().lower() in ("1", "true", "yes"))
+RUN_FIX_MAX_CONCURRENT = int(os.environ.get("RUN_FIX_MAX_CONCURRENT", "8"))
+RUN_FIX_SMOKE_TEST = (os.environ.get("RUN_FIX_SMOKE_TEST", "").strip().lower() in ("1", "true", "yes"))
+_run_fix_semaphore: asyncio.Semaphore | None = None
+
+
+def _get_run_fix_semaphore() -> asyncio.Semaphore:
+    global _run_fix_semaphore
+    if _run_fix_semaphore is None:
+        _run_fix_semaphore = asyncio.Semaphore(RUN_FIX_MAX_CONCURRENT)
+    return _run_fix_semaphore
+
 
 # ---------------------------------------------------------------------------
 # Event webhook: POST agent progress events to FastAPI /internal/event
@@ -739,13 +751,17 @@ def run_modal_agent(
 
 
 @mcp.tool()
-def run_fix(
+async def run_fix(
     instruction: str,
     repo_url: str = DEFAULT_REPO_URL,
     smoke_test: bool = False,
+    background: bool = False,
 ) -> str:
     """
     Run a fix instruction in a Modal sandbox with Claude Agent SDK, then push a branch and open a PR.
+
+    Multiple run_fix calls can run in parallel, limited by RUN_FIX_MAX_CONCURRENT (default 8).
+    Use background=True to start multiple jobs at once: each returns immediately while the job runs (no client timeout).
 
     This creates a sandboxed environment, clones the specified repository,
     runs the Claude Agent SDK with your instruction, and automatically
@@ -757,20 +773,20 @@ def run_fix(
         instruction: What to fix or change (e.g., "Fix the bug in auth.py" or "Add a test for login")
         repo_url: GitHub HTTPS URL to clone (defaults to treehacks-agent-repo)
         smoke_test: If true, wait for Vercel preview deploy and run a browser smoke test via Browserbase
+        background: If true, return immediately and run the fix in the background (use for multiple parallel agents)
 
     Returns:
         The PR URL, agent output, and optional smoke test results
     """
-    if RUN_FIX_IN_BACKGROUND:
+    effective_smoke = smoke_test or RUN_FIX_SMOKE_TEST
+    if RUN_FIX_IN_BACKGROUND or background:
         def _run():
             try:
                 run_modal_agent(
                     instruction=instruction,
                     repo_url=repo_url,
                     system_prompt=FIX_SYSTEM_PROMPT,
-                    smoke_test=smoke_test,
-                    start_command=start_command or None,
-                    app_port=app_port,
+                    smoke_test=effective_smoke,
                 )
             except Exception:
                 pass  # background; no way to return result to client
@@ -783,37 +799,47 @@ def run_fix(
         )
 
     try:
-        result = run_modal_agent(
-            instruction=instruction,
-            repo_url=repo_url,
-            system_prompt=FIX_SYSTEM_PROMPT,
-            smoke_test=smoke_test,
-        )
-        return result
+        loop = asyncio.get_event_loop()
+        async with _get_run_fix_semaphore():
+            return await loop.run_in_executor(
+                None,
+                lambda: run_modal_agent(
+                    instruction=instruction,
+                    repo_url=repo_url,
+                    system_prompt=FIX_SYSTEM_PROMPT,
+                    smoke_test=effective_smoke,
+                ),
+            )
     except Exception as e:
         return f"Error running fix: {str(e)}\n\nMake sure Modal is configured, ANTHROPIC_API_KEY and GITHUB_TOKEN are set."
 
 
 @mcp.tool()
-def run_fix_default_repo(instruction: str, smoke_test: bool = False) -> str:
+async def run_fix_default_repo(
+    instruction: str, smoke_test: bool = False, background: bool = False
+) -> str:
     """
     Quick fix on the default TreeHacks agent repository, with automatic PR.
+
+    Use background=True to start multiple agents at once; each returns immediately.
 
     Args:
         instruction: What to fix or change in the default repo
         smoke_test: If true, start the app after PR and run a browser smoke test via Browserbase
+        background: If true, return immediately and run in the background (use for multiple parallel agents)
 
     Returns:
         The PR URL, agent output, and optional smoke test results
     """
-    if RUN_FIX_IN_BACKGROUND:
+    effective_smoke = smoke_test or RUN_FIX_SMOKE_TEST
+    if RUN_FIX_IN_BACKGROUND or background:
         def _run():
             try:
                 run_modal_agent(
                     instruction=instruction,
                     repo_url=DEFAULT_REPO_URL,
                     system_prompt=FIX_SYSTEM_PROMPT,
-                    smoke_test=smoke_test,
+                    smoke_test=effective_smoke,
                 )
             except Exception:
                 pass
@@ -823,13 +849,17 @@ def run_fix_default_repo(instruction: str, smoke_test: bool = False) -> str:
         return "Job started in background (default repo). PR will be opened in a few minutes."
 
     try:
-        result = run_modal_agent(
-            instruction=instruction,
-            repo_url=DEFAULT_REPO_URL,
-            system_prompt=FIX_SYSTEM_PROMPT,
-            smoke_test=smoke_test,
-        )
-        return result
+        loop = asyncio.get_event_loop()
+        async with _get_run_fix_semaphore():
+            return await loop.run_in_executor(
+                None,
+                lambda: run_modal_agent(
+                    instruction=instruction,
+                    repo_url=DEFAULT_REPO_URL,
+                    system_prompt=FIX_SYSTEM_PROMPT,
+                    smoke_test=effective_smoke,
+                ),
+            )
     except Exception as e:
         return f"Error running fix: {str(e)}"
 

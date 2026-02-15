@@ -6,27 +6,18 @@ cd "$SCRIPT_DIR"
 
 VENV_PYTHON="$SCRIPT_DIR/.venv/bin/python"
 
-# Check if virtual environment exists
-if [ ! -f "$VENV_PYTHON" ]; then
-    echo "Creating virtual environment with uv..."
-    if command -v uv &> /dev/null; then
-        uv venv .venv
-        uv pip install -r requirements.txt -p "$VENV_PYTHON"
-    else
-        echo "Error: uv not found. Install with: curl -LsSf https://astral.sh/uv/install.sh | sh"
-        exit 1
-    fi
+# Recreate venv if missing or broken (encodings error common with moved Python / 3.14)
+if [ ! -f "$VENV_PYTHON" ] || ! "$VENV_PYTHON" -c "import encodings" 2>/dev/null; then
+    echo "Creating or fixing virtual environment..."
+    rm -rf .venv
+    python3 -m venv .venv
+    "$VENV_PYTHON" -m pip install -r requirements.txt -q
 fi
 
 # Check if Modal is installed
 if ! "$VENV_PYTHON" -c "import modal" 2>/dev/null; then
     echo "Installing Modal..."
-    if command -v uv &> /dev/null; then
-        uv pip install modal -p "$VENV_PYTHON"
-    else
-        echo "Error: uv not found"
-        exit 1
-    fi
+    "$VENV_PYTHON" -m pip install modal -q
 fi
 
 # Check for required environment variables

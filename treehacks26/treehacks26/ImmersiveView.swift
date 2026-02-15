@@ -455,8 +455,9 @@ struct ImmersiveView: View {
             blockState.agentStates[agentId] = .testing
             guard let character = blockState.characterEntities[agentId] else { return }
 
-            // Show webview above agent (vercel link)
-            blockState.testingWebviewURLs[agentId] = vercelLink
+            // Show webview: prefer Browserbase replay, else Vercel preview, else placeholder
+            let url = !browserbaseLink.isEmpty ? browserbaseLink : (!vercelLink.isEmpty ? vercelLink : "https://google.com")
+            blockState.testingWebviewURLs[agentId] = url
             if let webviewEntity = blockState.webviewEntities[agentId] {
                 webviewEntity.removeFromParent()
                 webviewEntity.position = [0, 1.0, 1.0]  // 1m above character, 1m forward (Z)
