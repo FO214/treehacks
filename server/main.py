@@ -39,6 +39,7 @@ class FixResponse(BaseModel):
 async def lifespan(app: FastAPI):
     # Register the running event loop so event_bus.broadcast_sync works from threads
     event_bus.set_loop(asyncio.get_running_loop())
+    print("[startup] /ws/spawn is in DEBUG mode (agent cycle + jump_ping). Connect Vision Pro to see send logs.", flush=True)
 
     voice.voice_startup()
     if voice.TALKBACK_ENABLED and voice.TTS_LOOP_AUTOSTART:
@@ -112,13 +113,14 @@ async def websocket_poke(websocket: WebSocket):
     try:
         while True:
             raw = await websocket.receive_text()
+            print(f"[ws/poke] ← received: {raw[:120]}{'…' if len(raw) > 120 else ''}")
             try:
                 msg = _json.loads(raw)
             except _json.JSONDecodeError:
                 continue
 
             msg_type = msg.get("type", "")
-            print(f"[ws/poke] ← {msg_type}")
+            print(f"[ws/poke] ← parsed type={msg_type!r}")
 
             if msg_type == "hand_open":
                 # Start recording from mic
@@ -146,32 +148,8 @@ async def websocket_poke(websocket: WebSocket):
 
 # ---------------------------------------------------------------------------
 # WebSocket: /ws/spawn — Vision Pro agent state stream
+# (Debug handler below; for prod use event_bus, swap to register(websocket) + receive loop)
 # ---------------------------------------------------------------------------
-
-@app.websocket("/ws/spawn")
-async def websocket_spawn(websocket: WebSocket):
-    """
-    Vision Pro connects here for agent lifecycle events.
-    Server pushes: create_agent_thinking, agent_start_working, agent_start_testing.
-    """
-    await websocket.accept()
-    event_bus.register(websocket)
-    print("[ws/spawn] client connected")
-    try:
-        # This WS is server→client only; keep connection alive by reading
-        while True:
-            await websocket.receive_text()
-    except WebSocketDisconnect:
-        print("[ws/spawn] client disconnected")
-    except Exception:
-        pass
-    finally:
-        event_bus.unregister(websocket)
-        try:
-            await websocket.close()
-        except Exception:
-            pass
-
 
 @app.post("/internal/event")
 async def internal_event(body: dict):
@@ -180,6 +158,8 @@ async def internal_event(body: dict):
     Broadcasts them to all connected WS clients (both /ws/poke and /ws/spawn).
     Event types: create_agent_thinking, agent_start_working, agent_start_testing.
     """
+    msg_type = body.get("type", "(no type)")
+    print(f"[internal/event] ← received type={msg_type!r}, broadcasting…")
     await event_bus.broadcast(body)
     return {"ok": True}
 
@@ -228,9 +208,12 @@ async def websocket_demo(websocket: WebSocket):
 
 async def _ws_send_jump_ping(websocket: WebSocket) -> None:
     """Send jump_ping every 2 seconds to make the palm tree jump."""
+    print("[ws/spawn] jump_ping loop started", flush=True)
     while True:
         msg = {"type": "jump_ping"}
-        await websocket.send_text(_json.dumps(msg))
+        payload = _json.dumps(msg)
+        print(f"[ws/spawn] → send: {payload}", flush=True)
+        await websocket.send_text(payload)
         await asyncio.sleep(2.0)
 
 
@@ -238,6 +221,7 @@ async def _ws_send_agent_cycle(websocket: WebSocket) -> None:
     """Send agent lifecycle messages: create_agent_thinking → agent_start_working → agent_start_testing.
     Cycles through agents 1-9 for each phase.
     """
+    print("[ws/spawn] agent_cycle loop started", flush=True)
     while True:
         # Phase 1: create_agent_thinking for each agent 1-9
         for agent_id in range(1, 10):
@@ -246,12 +230,16 @@ async def _ws_send_agent_cycle(websocket: WebSocket) -> None:
                 "agent_id": agent_id,
                 "task_name": "placeholder task",
             }
-            await websocket.send_text(_json.dumps(msg))
+            payload = _json.dumps(msg)
+            print(f"[ws/spawn] → send: {payload[:80]}…", flush=True)
+            await websocket.send_text(payload)
             await asyncio.sleep(0.5)
         # Phase 2: agent_start_working for each agent 1-9
         for agent_id in range(1, 10):
             msg = {"type": "agent_start_working", "agent_id": agent_id}
-            await websocket.send_text(_json.dumps(msg))
+            payload = _json.dumps(msg)
+            print(f"[ws/spawn] → send: {payload}", flush=True)
+            await websocket.send_text(payload)
             await asyncio.sleep(0.5)
         # Phase 3: agent_start_testing for each agent 1-9
         for agent_id in range(1, 10):
@@ -261,15 +249,18 @@ async def _ws_send_agent_cycle(websocket: WebSocket) -> None:
                 "vercel_link": "https://google.com",
                 "browserbase_link": "https://google.com",
             }
-            await websocket.send_text(_json.dumps(msg))
+            payload = _json.dumps(msg)
+            print(f"[ws/spawn] → send: {payload[:80]}…", flush=True)
+            await websocket.send_text(payload)
             await asyncio.sleep(0.5)
         await asyncio.sleep(2.0)  # Pause before next cycle
 
 
 @app.websocket("/ws/spawn")
 async def websocket_spawn(websocket: WebSocket):
-    """Stream agent lifecycle messages and jump_ping to Vision Pro."""
+    """Stream agent lifecycle messages and jump_ping to Vision Pro (DEBUG mode)."""
     await websocket.accept()
+    print("[ws/spawn] client connected — starting debug cycle + jump_ping", flush=True)
     try:
         await asyncio.gather(
             _ws_send_agent_cycle(websocket),

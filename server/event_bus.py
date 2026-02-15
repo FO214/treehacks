@@ -49,8 +49,11 @@ def unregister(ws: WebSocket) -> None:
 async def broadcast(event: dict[str, Any]) -> None:
     """Send *event* as JSON to every connected client. Silently drops failed sends."""
     payload = json.dumps(event)
+    msg_type = event.get("type", "(no type)")
     with _lock:
         clients = list(_clients)
+        n = len(clients)
+    print(f"[event_bus] → broadcast type={msg_type!r} to {n} client(s)")
     for ws in clients:
         try:
             await ws.send_text(payload)
