@@ -16,6 +16,7 @@ struct ImmersiveView: View {
     @Environment(AppModel.self) private var appModel
     @State private var demoValue: Int = 0
     @State private var blockState = DemoBlockState()
+    @State private var handTrackingManager = HandTrackingManager()
 
     var body: some View {
         RealityView { content in
@@ -39,6 +40,10 @@ struct ImmersiveView: View {
         }
         .onAppear {
             startPolling()
+            setupHandTracking()
+        }
+        .onDisappear {
+            handTrackingManager.stopTracking()
         }
     }
 
@@ -67,6 +72,41 @@ struct ImmersiveView: View {
             }
         } catch {
             // Silently ignore network errors (e.g. backend not running)
+        }
+    }
+
+    private func setupHandTracking() {
+        handTrackingManager.onOpenPalmDetected = {
+            await triggerRecordOnce()
+        }
+
+        Task {
+            await handTrackingManager.startTracking()
+        }
+    }
+
+    private func triggerRecordOnce() async {
+        // Call the voice server's record-once endpoint
+        guard let url = URL(string: "\(APIConfig.voiceServerURL)/record-once") else {
+            print("[HandTracking] Invalid voice server URL")
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = "{}".data(using: .utf8)
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            if let httpResponse = response as? HTTPURLResponse {
+                print("[HandTracking] record-once response: \(httpResponse.statusCode)")
+            }
+            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                print("[HandTracking] record-once result: \(json)")
+            }
+        } catch {
+            print("[HandTracking] record-once failed: \(error)")
         }
     }
 }
