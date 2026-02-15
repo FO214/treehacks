@@ -24,6 +24,16 @@ from . import voice
 from . import event_bus
 
 # ---------------------------------------------------------------------------
+# Agent state store: last event payload per agent_id (1-9). Updated by /internal/event;
+# status loop re-broadcasts each once per second so clients get a steady stream.
+# ---------------------------------------------------------------------------
+_agent_state_store: dict[int, dict[str, Any]] = {}
+
+# Connection counts per endpoint (for debugging: is client on /ws/spawn or /ws/poke?)
+_ws_spawn_connections = 0
+_ws_poke_connections = 0
+
+# ---------------------------------------------------------------------------
 # Atomic agent ID counter (1-9, wrapping). Owned by the main server.
 # ---------------------------------------------------------------------------
 import threading
@@ -51,17 +61,37 @@ class FixResponse(BaseModel):
     error: str | None = None
 
 
+async def _agent_status_stream_loop() -> None:
+    """Every 1 second, re-broadcast the last known state (same JSON) for each active agent."""
+    while True:
+        await asyncio.sleep(1.0)
+        for agent_id, msg in list(_agent_state_store.items()):
+            try:
+                await event_bus.broadcast(msg)
+            except Exception:
+                pass
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Register the running event loop so event_bus.broadcast_sync works from threads
     event_bus.set_loop(asyncio.get_running_loop())
-    print("[startup] /ws/spawn is in DEBUG mode (agent cycle + jump_ping). Connect Vision Pro to see send logs.", flush=True)
+    print("[startup] /ws/spawn forwards real agent events from /internal/event only.", flush=True)
 
     voice.voice_startup()
     if voice.TALKBACK_ENABLED and voice.TTS_LOOP_AUTOSTART:
         loop = asyncio.get_running_loop()
         voice.start_tts_loop(loop)
-    yield
+
+    status_task = asyncio.create_task(_agent_status_stream_loop())
+    try:
+        yield
+    finally:
+        status_task.cancel()
+        try:
+            await status_task
+        except asyncio.CancelledError:
+            pass
     voice.stop_tts_loop()
 
 
@@ -123,9 +153,11 @@ async def websocket_poke(websocket: WebSocket):
     Receives hand_open / hand_close gestures;
     broadcasts listening, poke_speaking events back.
     """
+    global _ws_poke_connections
     await websocket.accept()
+    _ws_poke_connections += 1
     event_bus.register(websocket)
-    print("[ws/poke] client connected")
+    print(f"[ws/poke] client connected (total poke: {_ws_poke_connections})", flush=True)
     try:
         while True:
             raw = await websocket.receive_text()
@@ -151,10 +183,11 @@ async def websocket_poke(websocket: WebSocket):
                 await voice.stop_and_process(on_event=_on_event)
 
     except WebSocketDisconnect:
-        print("[ws/poke] client disconnected")
+        print("[ws/poke] client disconnected", flush=True)
     except Exception as e:
-        print(f"[ws/poke] error: {e}")
+        print(f"[ws/poke] error: {e}", flush=True)
     finally:
+        _ws_poke_connections = max(0, _ws_poke_connections - 1)
         event_bus.unregister(websocket)
         try:
             await websocket.close()
@@ -171,10 +204,14 @@ async def websocket_poke(websocket: WebSocket):
 async def internal_event(body: dict):
     """
     Receives agent progress events from poke-mcp (cross-process webhook).
-    Broadcasts them to all connected WS clients (both /ws/poke and /ws/spawn).
+    Broadcasts them to all connected WS clients; stores last state per agent_id
+    so the status stream can re-send the same message once per second per agent.
     Event types: create_agent_thinking, agent_start_working, agent_start_testing.
     """
     msg_type = body.get("type", "(no type)")
+    agent_id = body.get("agent_id")
+    if isinstance(agent_id, int) and 1 <= agent_id <= 9:
+        _agent_state_store[agent_id] = dict(body)
     print(f"[internal/event] ← received type={msg_type!r}, broadcasting…")
     await event_bus.broadcast(body)
     return {"ok": True}
@@ -233,75 +270,43 @@ async def websocket_demo(websocket: WebSocket):
             pass
 
 
-async def _ws_send_jump_ping(websocket: WebSocket) -> None:
-    """Send jump_ping every 2 seconds to make the palm tree jump."""
-    print("[ws/spawn] jump_ping loop started", flush=True)
-    while True:
-        msg = {"type": "jump_ping"}
-        payload = _json.dumps(msg)
-        print(f"[ws/spawn] → send: {payload}", flush=True)
-        await websocket.send_text(payload)
-        await asyncio.sleep(2.0)
-
-
-async def _ws_send_agent_cycle(websocket: WebSocket) -> None:
-    """Send agent lifecycle messages: create_agent_thinking → agent_start_working → agent_start_testing.
-    Cycles through agents 1-9 for each phase.
-    """
-    print("[ws/spawn] agent_cycle loop started", flush=True)
-    while True:
-        # Phase 1: create_agent_thinking for each agent 1-9
-        for agent_id in range(1, 10):
-            msg = {
-                "type": "create_agent_thinking",
-                "agent_id": agent_id,
-                "task_name": "placeholder task",
-            }
-            payload = _json.dumps(msg)
-            print(f"[ws/spawn] → send: {payload[:80]}…", flush=True)
-            await websocket.send_text(payload)
-            await asyncio.sleep(0.5)
-        # Phase 2: agent_start_working for each agent 1-9
-        for agent_id in range(1, 10):
-            msg = {"type": "agent_start_working", "agent_id": agent_id}
-            payload = _json.dumps(msg)
-            print(f"[ws/spawn] → send: {payload}", flush=True)
-            await websocket.send_text(payload)
-            await asyncio.sleep(0.5)
-        # Phase 3: agent_start_testing for each agent 1-9
-        for agent_id in range(1, 10):
-            msg = {
-                "type": "agent_start_testing",
-                "agent_id": agent_id,
-                "vercel_link": "https://google.com",
-                "browserbase_link": "https://google.com",
-            }
-            payload = _json.dumps(msg)
-            print(f"[ws/spawn] → send: {payload[:80]}…", flush=True)
-            await websocket.send_text(payload)
-            await asyncio.sleep(0.5)
-        await asyncio.sleep(2.0)  # Pause before next cycle
-
-
 @app.websocket("/ws/spawn")
 async def websocket_spawn(websocket: WebSocket):
-    """Vision Pro agent UI. Sends debug cycle + jump_ping; also registers with event_bus so real events from poke-mcp (POST /internal/event) are forwarded."""
+    """Vision Pro agent UI. Only real events from poke-mcp (POST /internal/event) are forwarded; no debug cycle."""
+    global _ws_spawn_connections
     await websocket.accept()
+    _ws_spawn_connections += 1
     event_bus.register(websocket)
-    print("[ws/spawn] client connected — debug cycle + jump_ping + event_bus", flush=True)
+    # Send snapshot of current agent states so client can spawn characters that already exist
+    for _aid, stored in list(_agent_state_store.items()):
+        try:
+            await websocket.send_text(_json.dumps(stored))
+        except Exception:
+            break
+    print(f"[ws/spawn] client connected (total spawn: {_ws_spawn_connections}), sent {len(_agent_state_store)} snapshot(s)", flush=True)
     try:
-        await asyncio.gather(
-            _ws_send_agent_cycle(websocket),
-            _ws_send_jump_ping(websocket),
-        )
+        while True:
+            await websocket.receive_text()
     except Exception:
         pass
     finally:
+        _ws_spawn_connections = max(0, _ws_spawn_connections - 1)
+        print("[ws/spawn] client disconnected", flush=True)
         event_bus.unregister(websocket)
         try:
             await websocket.close()
         except Exception:
             pass
+
+
+@app.get("/debug/ws")
+async def debug_ws():
+    """Return how many clients are connected to each WebSocket path (to verify Vision Pro is on /ws/spawn)."""
+    return {
+        "ws_spawn": _ws_spawn_connections,
+        "ws_poke": _ws_poke_connections,
+        "event_bus_registered": event_bus.get_client_count(),
+    }
 
 
 # Voice endpoints

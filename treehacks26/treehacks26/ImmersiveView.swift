@@ -62,9 +62,17 @@ final class DemoBlockState {
     var wsConnected: Bool = false
     /// Agent IDs that received create_agent_thinking before root was ready; spawn when root appears.
     var pendingAgentSpawns: Set<Int> = []
+    /// Slot pool: indices 0..<9 that are free. New creatures take the first available; freed when creature is removed.
+    var availableSlotIndices: Set<Int> = Set(0..<9)
+    /// Maps server agent_id → slot index (0..<9) so we know which grid position each creature uses.
+    var agentIdToSlotIndex: [Int: Int] = [:]
 
-    /// User closed the webview for this agent; hide webview and remove character.
+    /// User closed the webview for this agent; hide webview and remove character. Returns the slot to the pool.
     func closeWebview(agentId: Int) {
+        if let slot = agentIdToSlotIndex[agentId] {
+            availableSlotIndices.insert(slot)
+            agentIdToSlotIndex.removeValue(forKey: agentId)
+        }
         testingWebviewURLs.removeValue(forKey: agentId)
         webviewEntities[agentId]?.removeFromParent()
         thinkingIndicatorEntities[agentId]?.removeFromParent()
@@ -430,6 +438,8 @@ struct ImmersiveView: View {
             blockState.wsConnected = false
             blockState.lastWsMessage = ""
             blockState.pendingAgentSpawns = []
+            blockState.availableSlotIndices = Set(0..<9)
+            blockState.agentIdToSlotIndex = [:]
         }
     }
 
@@ -506,14 +516,15 @@ struct ImmersiveView: View {
             blockState.whiteboardAgentIndicators.removeValue(forKey: agentId)
         }
 
-        // Add indicators for newly running agents
+        // Add indicators for newly running agents (position by slot index so dot matches grid)
         let circleSpacing: Float = 0.06 * Self.scaleFactor
         let gridOriginX: Float = 0.35 * Self.scaleFactor  // Right of diagram center
         for agentId in runningIds {
-            if blockState.whiteboardAgentIndicators[agentId] == nil {
+            if blockState.whiteboardAgentIndicators[agentId] == nil,
+               let slotIndex = blockState.agentIdToSlotIndex[agentId] {
                 let circle = Self.makeAgentCircleIndicator(agentId: agentId)
-                let col = (agentId - 1) % 3
-                let row = (agentId - 1) / 3
+                let col = slotIndex % 3
+                let row = slotIndex / 3
                 circle.position = [
                     gridOriginX + (Float(col) - 1) * circleSpacing,
                     (Float(row) - 1) * circleSpacing,
@@ -672,7 +683,7 @@ struct ImmersiveView: View {
         }
     }
 
-    /// Spawns or resets a character in the given state. Handles out-of-order messages.
+    /// Spawns or resets a character in the given state. Ignores server agent number for position; uses first available slot.
     private func spawnOrResetCharacter(agentId: Int, targetState: AgentState, vercelLink: String = "") {
         guard let root = blockState.rootEntity else {
             if targetState == .thinking {
@@ -681,7 +692,11 @@ struct ImmersiveView: View {
             return
         }
 
-        // Full reset of slot (idempotent)
+        // Full reset of this agent (idempotent). Return its slot to the pool if it had one.
+        if let previousSlot = blockState.agentIdToSlotIndex[agentId] {
+            blockState.availableSlotIndices.insert(previousSlot)
+            blockState.agentIdToSlotIndex.removeValue(forKey: agentId)
+        }
         blockState.testingWebviewURLs.removeValue(forKey: agentId)
         blockState.webviewEntities[agentId]?.removeFromParent()
         blockState.thinkingIndicatorEntities[agentId]?.removeFromParent()
@@ -692,8 +707,12 @@ struct ImmersiveView: View {
             blockState.characterEntities.removeValue(forKey: agentId)
         }
 
-        let gridIndex = agentId - 1
-        let gridPos = Self.gridPositions[gridIndex]
+        // Take first available slot (order 0, 1, 2, …); if none free, don't spawn.
+        guard let slotIndex = blockState.availableSlotIndices.sorted().first else { return }
+        blockState.availableSlotIndices.remove(slotIndex)
+        blockState.agentIdToSlotIndex[agentId] = slotIndex
+
+        let gridPos = Self.gridPositions[slotIndex]
         let targetY = Self.targetBoundsSize / 2 + 1.2 - 0.5
         let characterZOffset: Float = +1  // Z offset from grid (negative = towards user)
 

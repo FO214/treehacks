@@ -39,11 +39,21 @@ def set_loop(loop: asyncio.AbstractEventLoop) -> None:
 def register(ws: WebSocket) -> None:
     with _lock:
         _clients.add(ws)
+        n = len(_clients)
+    print(f"[event_bus] client registered → {n} client(s)", flush=True)
 
 
 def unregister(ws: WebSocket) -> None:
     with _lock:
         _clients.discard(ws)
+        n = len(_clients)
+    print(f"[event_bus] client unregistered → {n} client(s)", flush=True)
+
+
+def get_client_count() -> int:
+    """Return number of registered WebSocket clients (for /debug/ws)."""
+    with _lock:
+        return len(_clients)
 
 
 async def broadcast(event: dict[str, Any]) -> None:
