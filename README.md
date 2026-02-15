@@ -150,6 +150,65 @@ response = requests.post(
 print(response.json())
 ```
 
+### Voice service (chat.db poller + STT/TTS endpoints)
+
+This repo includes a local voice service at `voice-server.mjs` that does:
+
+1. Initialize a new `Poke` client on startup.
+2. Read latest `message.date`/`ROWID` for `POKE_HANDLE_ID` as the startup checkpoint.
+3. Poll `chat.db` every few seconds for new inbound messages from that handle.
+4. Queue inbound messages in memory.
+5. Expose endpoints to run one recording turn, STT, and TTS.
+
+Run it from repo root:
+
+```bash
+npm install
+npm run voice
+```
+
+For auto-restart on `.env` or `voice-server.mjs` changes during development:
+
+```bash
+npm run voice:dev
+```
+
+Required env vars:
+- `POKE_API_KEY`
+- `OPENAI_API_KEY`
+- `POKE_HANDLE_ID` (Messages `handle_id` for Poke contact)
+
+Optional env vars:
+- `POKE_SESSION_BOOT_MESSAGE` (sent once to Poke on startup)
+- `STT_MODEL` (default `gpt-4o-mini-transcribe`)
+- `TTS_MODEL` (default `gpt-4o-mini-tts`)
+- `TTS_VOICE` (default `alloy`)
+- `TTS_SPEED` (default `1.0`)
+- `TTS_RESPONSE_FORMAT` (`wav` or `pcm`; default auto: `pcm` with `ffplay`, else `wav`)
+- `TTS_BATCH_QUEUE` (default `true`; when true, queued inbound messages are concatenated and spoken together)
+- `TTS_BATCH_SEPARATOR` (default `" "`; separator used between concatenated queued messages)
+- `SOUND_EFFECTS_ENABLED` (default `true`)
+- `SOUND_EFFECTS_DIR` (default `./sound-effects`)
+- `START_RECORDING_SOUND` (default `start-recording.mp3`)
+- `STOP_RECORDING_SOUND` (default `stop-recording.mp3`)
+- `NO_RECORDING_SOUND` (default `no-recording.mp3`)
+- `MIN_AUDIO_BYTES` (default `8000`)
+- `CHAT_DB_PATH` (default `~/Library/Messages/chat.db`)
+- `CHAT_POLL_MS` (default `1000`)
+- `RESPONSE_TIMEOUT_MS` (default `120000`)
+- `VOICE_HTTP_PORT` (default `8787`)
+
+Endpoints:
+- `POST /record-once` (record -> STT -> send to Poke -> await next inbound chat.db message -> optional TTS talkback)
+- `POST /stt` with `{ "audioPath": "/abs/path/to/file.wav" }`
+- `POST /tts` with `{ "text": "hello" }`
+- `GET /queue` and `POST /queue/speak-next`
+- `GET /health`
+
+Local system tools needed for audio I/O:
+- `rec` (SoX) for recording with silence detection
+- `afplay` (macOS) or `ffplay` for playback
+
 ## Project layout
 
 ```

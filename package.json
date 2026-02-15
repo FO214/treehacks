@@ -1,5 +1,13 @@
 {
+  "type": "module",
+  "scripts": {
+    "voice": "node voice-server.mjs",
+    "voice:dev": "node --watch --watch-path=.env --watch-path=voice-server.mjs voice-server.mjs"
+  },
   "dependencies": {
+    "dotenv": "^17.2.3",
+    "express": "^5.1.0",
+    "openai": "^6.3.0",
     "poke": "^0.2.5"
   }
 }
