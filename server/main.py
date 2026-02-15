@@ -206,17 +206,6 @@ async def websocket_demo(websocket: WebSocket):
             pass
 
 
-async def _ws_send_jump_ping(websocket: WebSocket) -> None:
-    """Send jump_ping every 2 seconds to make the palm tree jump."""
-    print("[ws/spawn] jump_ping loop started", flush=True)
-    while True:
-        msg = {"type": "jump_ping"}
-        payload = _json.dumps(msg)
-        print(f"[ws/spawn] → send: {payload}", flush=True)
-        await websocket.send_text(payload)
-        await asyncio.sleep(2.0)
-
-
 async def _ws_send_agent_cycle(websocket: WebSocket) -> None:
     """Send agent lifecycle messages: create_agent_thinking → agent_start_working → agent_start_testing.
     Cycles through agents 1-9 for each phase.
@@ -256,16 +245,20 @@ async def _ws_send_agent_cycle(websocket: WebSocket) -> None:
         await asyncio.sleep(2.0)  # Pause before next cycle
 
 
+@app.post("/palm-touched")
+async def palm_touched(body: dict | None = None):
+    """Receive jump_ping when user touches the palm tree. Body: {"type": "jump_ping"}."""
+    print(f"[palm-touched] {body}", flush=True)
+    return {"ok": True}
+
+
 @app.websocket("/ws/spawn")
 async def websocket_spawn(websocket: WebSocket):
-    """Stream agent lifecycle messages and jump_ping to Vision Pro (DEBUG mode)."""
+    """Stream agent lifecycle messages to Vision Pro (jump_ping only on palm tree touch)."""
     await websocket.accept()
-    print("[ws/spawn] client connected — starting debug cycle + jump_ping", flush=True)
+    print("[ws/spawn] client connected — starting debug cycle", flush=True)
     try:
-        await asyncio.gather(
-            _ws_send_agent_cycle(websocket),
-            _ws_send_jump_ping(websocket),
-        )
+        await _ws_send_agent_cycle(websocket)
     except Exception:
         pass
     finally:

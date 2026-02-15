@@ -9,10 +9,12 @@ import ARKit
 import RealityKitContent
 import UIKit
 
-/// Agent state machine: thinking → working → testing. Strict order; out-of-order messages ignored.
-/// - thinking: Character spawned, awaiting start_working
-/// - working: Awaiting agent_start_testing
-/// - testing: Webview shown, character persists until user closes
+/// Agent state machine: thinking → working → testing.
+/// Handles out-of-order messages: if a later-state message arrives before earlier ones,
+/// the character is spawned directly in that state.
+/// - thinking: Character spawned with thinking indicator, awaiting start_working
+/// - working: No thinking indicator, awaiting agent_start_testing
+/// - testing: Webview shown, character jumped up, persists until user closes
 enum AgentState: String {
     case thinking
     case working
@@ -33,17 +35,27 @@ final class DemoBlockState {
     /// Cached webview attachment entities (populated in make closure).
     var webviewEntities: [Int: Entity] = [:]
     var planeAnchor: AnchorEntity?
+    /// Head anchor for repositioning (root moves here when palm open).
+    var headAnchor: AnchorEntity?
     var whiteboardEntity: Entity?
     /// Palm tree in corner of floor (for jump_ping animation).
     var palmTreeEntity: Entity?
-    /// Cached character.usdc; cloned when spawning.
+    /// True while palm tree is mid-jump; ignores new jump_ping until done.
+    var isPalmTreeJumping = false
+    /// Cached charc.usdc; cloned when spawning.
     var characterTemplate: Entity?
+    /// Cached thinking.usdz; shown above head when in thinking mode.
+    var thinkingTemplate: Entity?
     /// Cached computerSpawn_2.usdz; used for static desks.
     var computerDeskTemplate: Entity?
+    /// Thinking indicator entities per agent (child of character); shaken in update loop.
+    var thinkingIndicatorEntities: [Int: Entity] = [:]
     /// When true, root follows gaze (where user is looking) instead of hand.
     var isRepositioningMode = false
     /// True after we've placed root near user; avoids spawn at plane anchor center (often far away).
     var hasInitialPlacement = false
+    /// Last frame palm state in repositioning mode (for open→closed transition to plop).
+    var wasPalmOpenInRepositioning = false
 
     /// Debug: last WebSocket message received (shown on-screen).
     var lastWsMessage: String = ""
@@ -54,6 +66,8 @@ final class DemoBlockState {
     func closeWebview(agentId: Int) {
         testingWebviewURLs.removeValue(forKey: agentId)
         webviewEntities[agentId]?.removeFromParent()
+        thinkingIndicatorEntities[agentId]?.removeFromParent()
+        thinkingIndicatorEntities.removeValue(forKey: agentId)
         characterEntities[agentId]?.removeFromParent()
         characterEntities.removeValue(forKey: agentId)
         agentStates.removeValue(forKey: agentId)
@@ -79,6 +93,8 @@ struct ImmersiveView: View {
     private static let deskTargetSize: Float = 0.15 * scaleFactor
     /// Character scale multiplier (characters need to be much larger to be visible).
     private static let characterScaleMultiplier: Float = 3
+    /// Character size reduction (0.7 = 30% smaller).
+    private static let characterSizeReduction: Float = 0.7
     /// Extra 2x scale for desks and characters only (not spacing).
     private static let deskAndCharacterSizeMultiplier: Float = 2
     private static let gridSpacing: Float = 0.12 * scaleFactor + 1
@@ -90,7 +106,7 @@ struct ImmersiveView: View {
         for row in 0..<gridCols {
             for col in 0..<gridCols {
                 positions.append([
-                    half - Float(col) * gridSpacing,  // flipped horizontal
+                    Float(col) * gridSpacing - half,  // horizontal (opposite of previous)
                     targetBoundsSize / 2, // sit on floor
                     Float(row) * gridSpacing - half
                 ])
@@ -124,13 +140,18 @@ struct ImmersiveView: View {
             anchor.addChild(root)
             content.add(anchor)
 
+            // Head anchor: for repositioning mode when palm open (root moves here)
+            let head = AnchorEntity(.head)
+            content.add(head)
+            blockState.headAnchor = head
+
             // Whiteboard: 1.5m closer than before (was 1.2m, now 0.3m in front)
             Task { @MainActor in
                 if let whiteboard = try? await Entity(named: "fixed_whiteboard.usdc", in: realityKitContentBundle) {
                     whiteboard.name = "whiteboard"
                     whiteboard.position = [0, 0.5 * Self.scaleFactor - 2, -0.3 * Self.scaleFactor]  // 2m lower, in front of origin
                     anchor.addChild(whiteboard)
-                    Self.scaleToBoundsSize(whiteboard, targetSize: Self.targetBoundsSize * 15 / 4)  // 1/4 size
+                    Self.scaleToBoundsSize(whiteboard, targetSize: Self.targetBoundsSize * 15 / 2)  // 2x size (was 15/4)
                     blockState.whiteboardEntity = whiteboard
 
                     // Diagram from project root (diagram.svg → diagram.png), snapped to front of whiteboard
@@ -168,8 +189,11 @@ struct ImmersiveView: View {
 
             // Load templates and create 9 static desks (computer on desk)
             Task { @MainActor in
-                if let character = try? await Entity(named: "char.usdc", in: realityKitContentBundle) {
+                if let character = try? await Entity(named: "charc.usdc", in: realityKitContentBundle) {
                     blockState.characterTemplate = character
+                }
+                if let thinking = try? await Entity(named: "thinking.usdz", in: realityKitContentBundle) {
+                    blockState.thinkingTemplate = thinking
                 }
                 if let computer = try? await Entity(named: "computerSpawn_2.usdz", in: realityKitContentBundle),
                    let root = blockState.rootEntity {
@@ -184,8 +208,14 @@ struct ImmersiveView: View {
                         Self.scaleToBoundsSize(desk, targetSize: Self.targetBoundsSize * Self.deskAndCharacterSizeMultiplier)
                     }
 
-                    // Palm tree: same x,z as first desk, base on floor (y=0)
+                    // Palm tree: 2m further from grid center than first desk
                     let gridPos0 = Self.gridPositions[0]
+                    let epicenterOffset: Float = 2.0
+                    let xz = SIMD2<Float>(gridPos0.x, gridPos0.z)
+                    let dist = simd_length(xz)
+                    let palmXZ: SIMD2<Float> = dist > 0.001
+                        ? xz + epicenterOffset * (xz / dist)
+                        : xz + [epicenterOffset, 0]  // fallback if at center
                     let deskTargetSize = Self.targetBoundsSize * Self.deskAndCharacterSizeMultiplier
                     let palmTree: Entity
                     if let model = try? await Entity(named: "palmtreelowpolygon.usdz", in: realityKitContentBundle) {
@@ -198,7 +228,13 @@ struct ImmersiveView: View {
                     palmTree.name = "palm_tree"
                     // Floor is at y=0; put base on floor (center at half-height for origin-at-center models)
                     let palmHalfHeight = deskTargetSize / 2
-                    palmTree.position = [gridPos0.x, palmHalfHeight, gridPos0.z]
+                    palmTree.position = [palmXZ.x, palmHalfHeight, palmXZ.y]
+                    // Touch detection: CollisionComponent + InputTargetComponent
+                    let collisionShape = ShapeResource.generateBox(size: [deskTargetSize, deskTargetSize, deskTargetSize])
+                    palmTree.components.set([
+                        CollisionComponent(shapes: [collisionShape]),
+                        InputTargetComponent(),
+                    ])
                     root.addChild(palmTree)
                     blockState.palmTreeEntity = palmTree
                 }
@@ -208,35 +244,60 @@ struct ImmersiveView: View {
             // SceneEvents.Update may run off main thread; HandTrackingManager is @MainActor
             updateSubscription = content.subscribe(to: SceneEvents.Update.self) { _ in
                 Task { @MainActor in
-                    guard let planeAnchor = blockState.planeAnchor else { return }
+                    // Shake thinking indicators
+                    let t = Float(ProcessInfo.processInfo.systemUptime)
+                    for (_, entity) in blockState.thinkingIndicatorEntities {
+                        let shakeX = sin(t * 12) * 0.06
+                        let shakeZ = sin(t * 10 + 1) * 0.06
+                        let rotX = simd_quatf(angle: shakeX, axis: [1, 0, 0])
+                        let rotZ = simd_quatf(angle: shakeZ, axis: [0, 0, 1])
+                        entity.orientation = rotZ * rotX
+                    }
+
+                    guard let planeAnchor = blockState.planeAnchor,
+                          let headAnchor = blockState.headAnchor,
+                          let root = blockState.rootEntity else { return }
+
+                    let palmOpen = handTrackingManager.isPalmCurrentlyOpen()
 
                     if let deviceAnchor = handTrackingManager.queryDeviceAnchor() {
-                        // Device tracking: 45cm in front of user on the surface
                         let t = deviceAnchor.originFromAnchorTransform
                         let devicePos = SIMD3<Float>(t.columns.3.x, t.columns.3.y, t.columns.3.z)
-                        let forward = SIMD3<Float>(-t.columns.2.x, -t.columns.2.y, -t.columns.2.z)
+                        let forward = SIMD3<Float>(t.columns.2.x, t.columns.2.y, t.columns.2.z)
                         let horizontalForward = simd_normalize(SIMD3<Float>(forward.x, 0, forward.z))
 
-                        if simd_length(horizontalForward) > 0.1 {
-                            // Place center of grid directly in front of user (2m), not at corner
+                        if !blockState.hasInitialPlacement, simd_length(horizontalForward) > 0.1 {
+                            // Initial placement: snap to 2m in front on surface
                             let distanceInFront: Float = 2.0
                             let pointInFront = devicePos + horizontalForward * distanceInFront
                             let surfaceY = planeAnchor.position(relativeTo: nil).y
                             let hitWorld = SIMD3<Float>(pointInFront.x, surfaceY, pointInFront.z)
-
-                            // Root: only when initial placement or repositioning (palm open)
-                            let shouldUpdateRoot = !blockState.hasInitialPlacement
-                                || (blockState.isRepositioningMode && handTrackingManager.isPalmCurrentlyOpen())
-                            if shouldUpdateRoot, let root = blockState.rootEntity {
-                                let localPos = planeAnchor.convert(position: hitWorld, from: nil)
-                                let middleChildCenterOffset: Float = Self.targetBoundsSize / 2
-                                root.position = SIMD3<Float>(localPos.x, localPos.y - middleChildCenterOffset, localPos.z)
-                                blockState.hasInitialPlacement = true
+                            let localPos = planeAnchor.convert(position: hitWorld, from: nil)
+                            let middleChildCenterOffset: Float = Self.targetBoundsSize / 2
+                            root.position = SIMD3<Float>(localPos.x, localPos.y - middleChildCenterOffset, localPos.z)
+                            blockState.hasInitialPlacement = true
+                        } else if blockState.isRepositioningMode {
+                            if palmOpen {
+                                // Palm open: head-locked, statically 2m in front
+                                if root.parent != headAnchor {
+                                    root.removeFromParent()
+                                    headAnchor.addChild(root)
+                                }
+                                root.position = [0, 0, -2.0]  // 2m in front of head, level
+                                blockState.wasPalmOpenInRepositioning = true
+                            } else if blockState.wasPalmOpenInRepositioning {
+                                // Palm just released: plop to surface under current position
+                                plopRootFromHeadToSurface()
+                                blockState.wasPalmOpenInRepositioning = false
                             }
                         }
                     } else {
                         // Simulator or no tracking
-                        if let root = blockState.rootEntity {
+                        if let root = blockState.rootEntity, let planeAnchor = blockState.planeAnchor {
+                            if root.parent == blockState.headAnchor {
+                                root.removeFromParent()
+                                planeAnchor.addChild(root)
+                            }
                             root.position = [0, 0, -0.5 * Self.scaleFactor]
                             blockState.hasInitialPlacement = true
                         }
@@ -257,6 +318,18 @@ struct ImmersiveView: View {
                 }
             }
         }
+        .gesture(
+            TapGesture()
+                .targetedToAnyEntity()
+                .onEnded { value in
+                    if value.entity.name == "palm_tree" {
+                        Task { @MainActor in
+                            await handleJumpPing()
+                            postPalmTouched()
+                        }
+                    }
+                }
+        )
 
             // Overlay: show when root is searching for a surface to latch to
             if !blockState.hasInitialPlacement {
@@ -296,6 +369,11 @@ struct ImmersiveView: View {
         .onChange(of: appModel.repositioningMode) { _, newValue in
             blockState.isRepositioningMode = newValue
             handTrackingManager.isRepositioningMode = newValue
+            blockState.wasPalmOpenInRepositioning = false
+            // When exiting repositioning: plop root down to surface at current location
+            if !newValue {
+                plopRootToSurface()
+            }
         }
         .onAppear {
             blockState.isRepositioningMode = appModel.repositioningMode
@@ -326,16 +404,57 @@ struct ImmersiveView: View {
             blockState.rootEntity = nil
             blockState.characterEntities = [:]
             blockState.agentStates = [:]
+            blockState.thinkingIndicatorEntities = [:]
             blockState.testingWebviewURLs = [:]
             blockState.webviewEntities = [:]
             blockState.planeAnchor = nil
+            blockState.headAnchor = nil
             blockState.whiteboardEntity = nil
             blockState.palmTreeEntity = nil
+            blockState.isPalmTreeJumping = false
             blockState.characterTemplate = nil
+            blockState.thinkingTemplate = nil
             blockState.computerDeskTemplate = nil
             blockState.hasInitialPlacement = false
+            blockState.wasPalmOpenInRepositioning = false
             blockState.wsConnected = false
             blockState.lastWsMessage = ""
+        }
+    }
+
+    /// Snap root to surface at current XZ (root already under plane anchor).
+    private func plopRootToSurfaceAtCurrentXZ() {
+        guard let planeAnchor = blockState.planeAnchor,
+              let root = blockState.rootEntity else { return }
+        let rootWorldPos = root.position(relativeTo: nil)
+        let surfaceY = planeAnchor.position(relativeTo: nil).y
+        let hitWorld = SIMD3<Float>(rootWorldPos.x, surfaceY, rootWorldPos.z)
+        let localPos = planeAnchor.convert(position: hitWorld, from: nil)
+        let middleChildCenterOffset: Float = Self.targetBoundsSize / 2
+        root.position = SIMD3<Float>(localPos.x, localPos.y - middleChildCenterOffset, localPos.z)
+    }
+
+    /// Move root from head anchor to plane anchor, plop to surface at current XZ.
+    private func plopRootFromHeadToSurface() {
+        guard let planeAnchor = blockState.planeAnchor,
+              let root = blockState.rootEntity else { return }
+        let rootWorldPos = root.position(relativeTo: nil)
+        root.removeFromParent()
+        planeAnchor.addChild(root)
+        let surfaceY = planeAnchor.position(relativeTo: nil).y
+        let hitWorld = SIMD3<Float>(rootWorldPos.x, surfaceY, rootWorldPos.z)
+        let localPos = planeAnchor.convert(position: hitWorld, from: nil)
+        let middleChildCenterOffset: Float = Self.targetBoundsSize / 2
+        root.position = SIMD3<Float>(localPos.x, localPos.y - middleChildCenterOffset, localPos.z)
+    }
+
+    /// Snap root to surface (called when exiting repositioning mode via toggle).
+    private func plopRootToSurface() {
+        guard let root = blockState.rootEntity else { return }
+        if root.parent == blockState.headAnchor {
+            plopRootFromHeadToSurface()
+        } else {
+            plopRootToSurfaceAtCurrentXZ()
         }
     }
 
@@ -360,6 +479,14 @@ struct ImmersiveView: View {
     private static func makePalmTreePlaceholder() -> Entity {
         let mesh = MeshResource.generateCylinder(height: 1.0, radius: 0.1)
         let mat = SimpleMaterial(color: .systemGreen, isMetallic: false)
+        return ModelEntity(mesh: mesh, materials: [mat])
+    }
+
+    /// Placeholder thinking indicator (yellow sphere) when thinking.usdz is not available.
+    private static func makeThinkingPlaceholder() -> Entity {
+        let size: Float = 0.08 * Self.scaleFactor
+        let mesh = MeshResource.generateSphere(radius: size / 2)
+        let mat = SimpleMaterial(color: .systemYellow, isMetallic: false)
         return ModelEntity(mesh: mesh, materials: [mat])
     }
 
@@ -406,9 +533,7 @@ struct ImmersiveView: View {
                         if let data = text.data(using: .utf8),
                            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                            let type = json["type"] as? String {
-                            if type == "jump_ping" {
-                                await handleJumpPing()
-                            } else if let agentId = json["agent_id"] as? Int, (1...9).contains(agentId) {
+                            if let agentId = json["agent_id"] as? Int, (1...9).contains(agentId) {
                                 switch type {
                                 case "create_agent_thinking":
                                     await handleCreateAgentThinking(agentId: agentId, taskName: json["task_name"] as? String ?? "")
@@ -441,45 +566,25 @@ struct ImmersiveView: View {
 
     private func handleCreateAgentThinking(agentId: Int, taskName: String) async {
         await MainActor.run {
-            guard let root = blockState.rootEntity else { return }
-
-            // Full reset of slot: remove character, webview, and state (idempotent)
-            blockState.testingWebviewURLs.removeValue(forKey: agentId)
-            blockState.webviewEntities[agentId]?.removeFromParent()
-            blockState.agentStates.removeValue(forKey: agentId)
-            if let existing = blockState.characterEntities[agentId] {
-                existing.removeFromParent()
-                blockState.characterEntities.removeValue(forKey: agentId)
-            }
-
-            let gridIndex = agentId - 1
-            let character: Entity
-            if let template = blockState.characterTemplate {
-                character = template.clone(recursive: true)
-                let baseSize = Self.deskTargetSize * Self.characterScaleMultiplier * Self.deskAndCharacterSizeMultiplier
-                Self.scaleToBoundsSize(character, targetSize: baseSize / 4)
-            } else {
-                character = Self.makePlaceholderDesk()
-            }
-            character.name = "character_\(agentId)"
-            character.orientation = simd_quatf(angle: 70 * .pi / 180, axis: [0, 1, 0])
-            let gridPos = Self.gridPositions[gridIndex]
-            let targetY = Self.targetBoundsSize / 2 + 1.2 - 0.5
-            // Start 1m below, then smooth jump up to final position
-            character.position = [gridPos.x, targetY - 1.0, gridPos.z - 1.0]
-            root.addChild(character)
-            blockState.characterEntities[agentId] = character
-            blockState.agentStates[agentId] = .thinking
-
-            var targetTransform = character.transform
-            targetTransform.translation = [gridPos.x, targetY, gridPos.z - 1.0]
-            character.move(to: targetTransform, relativeTo: root, duration: 0.6, timingFunction: .easeOut)
+            spawnOrResetCharacter(agentId: agentId, targetState: .thinking)
         }
+    }
+
+    private func postPalmTouched() {
+        guard let url = URL(string: "\(APIConfig.baseURL)/palm-touched") else { return }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = "{\"type\":\"jump_ping\"}".data(using: .utf8)
+        URLSession.shared.dataTask(with: request) { _, _, _ in }.resume()
     }
 
     private func handleJumpPing() async {
         await MainActor.run {
+            guard !blockState.isPalmTreeJumping else { return }  // Ignore if already jumping
             guard let palmTree = blockState.palmTreeEntity, let parent = palmTree.parent else { return }
+            blockState.isPalmTreeJumping = true
+
             let jumpHeight: Float = 0.5
             let duration: TimeInterval = 0.25
 
@@ -492,40 +597,126 @@ struct ImmersiveView: View {
                 var downTransform = palmTree.transform
                 downTransform.translation.y -= jumpHeight
                 palmTree.move(to: downTransform, relativeTo: parent, duration: duration, timingFunction: .easeIn)
+                try? await Task.sleep(for: .seconds(duration))
+                blockState.isPalmTreeJumping = false  // Ready for next jump
             }
         }
     }
 
     private func handleAgentStartWorking(agentId: Int) async {
         await MainActor.run {
-            guard blockState.agentStates[agentId] == .thinking,
-                  blockState.characterEntities[agentId] != nil else { return }
-            blockState.agentStates[agentId] = .working
+            if let character = blockState.characterEntities[agentId] {
+                // Character exists: transition thinking → working (remove thinking indicator)
+                if blockState.agentStates[agentId] == .thinking {
+                    blockState.thinkingIndicatorEntities[agentId]?.removeFromParent()
+                    blockState.thinkingIndicatorEntities.removeValue(forKey: agentId)
+                    blockState.agentStates[agentId] = .working
+                }
+                // Already working or testing: no-op
+            } else {
+                // No character: spawn directly in working state (e.g. missed create_agent_thinking)
+                spawnOrResetCharacter(agentId: agentId, targetState: .working)
+            }
         }
     }
 
     private func handleAgentStartTesting(agentId: Int, vercelLink: String, browserbaseLink: String) async {
         await MainActor.run {
-            guard blockState.agentStates[agentId] == .working,
-                  let character = blockState.characterEntities[agentId] else { return }
-            blockState.agentStates[agentId] = .testing
-
-            // Show webview above agent (vercel link); fallback to google.com if empty
             let urlToShow = vercelLink.trimmingCharacters(in: .whitespacesAndNewlines)
-            blockState.testingWebviewURLs[agentId] = urlToShow.isEmpty ? "https://www.google.com" : urlToShow
-            if let webviewEntity = blockState.webviewEntities[agentId] {
-                webviewEntity.removeFromParent()
-                webviewEntity.position = [0, 1.0, 1.0]  // 1m above character, 1m forward (Z)
-                character.addChild(webviewEntity)
+            let url = urlToShow.isEmpty ? "https://www.google.com" : urlToShow
+
+            if let container = blockState.characterEntities[agentId] {
+                // Character exists: transition to testing (thinking or working → testing)
+                blockState.thinkingIndicatorEntities[agentId]?.removeFromParent()
+                blockState.thinkingIndicatorEntities.removeValue(forKey: agentId)
+                blockState.agentStates[agentId] = .testing
+                blockState.testingWebviewURLs[agentId] = url
+                applyTestingState(container: container, agentId: agentId)
+            } else {
+                // No character: spawn directly in testing state
+                spawnOrResetCharacter(agentId: agentId, targetState: .testing, vercelLink: url)
             }
-
-            // Smooth jump 1m upward; webview stays child of character, both persist until user closes
-            let currentTransform = character.transform
-            var targetTransform = currentTransform
-            targetTransform.translation.y += 1.0  // 1m up
-
-            character.move(to: targetTransform, relativeTo: character.parent, duration: 0.8, timingFunction: .easeOut)
         }
+    }
+
+    /// Spawns or resets a character in the given state. Handles out-of-order messages.
+    private func spawnOrResetCharacter(agentId: Int, targetState: AgentState, vercelLink: String = "") {
+        guard let root = blockState.rootEntity else { return }
+
+        // Full reset of slot (idempotent)
+        blockState.testingWebviewURLs.removeValue(forKey: agentId)
+        blockState.webviewEntities[agentId]?.removeFromParent()
+        blockState.thinkingIndicatorEntities[agentId]?.removeFromParent()
+        blockState.thinkingIndicatorEntities.removeValue(forKey: agentId)
+        blockState.agentStates.removeValue(forKey: agentId)
+        if let existing = blockState.characterEntities[agentId] {
+            existing.removeFromParent()
+            blockState.characterEntities.removeValue(forKey: agentId)
+        }
+
+        let gridIndex = agentId - 1
+        let gridPos = Self.gridPositions[gridIndex]
+        let targetY = Self.targetBoundsSize / 2 + 1.2 - 0.5
+
+        // Container: no rotation; handles position and jump. Webview/thinking indicator stay world-aligned.
+        let container = Entity()
+        container.name = "character_\(agentId)"
+        container.position = [gridPos.x, targetY - 1.0, gridPos.z - 1.0]
+        root.addChild(container)
+        blockState.characterEntities[agentId] = container
+        blockState.agentStates[agentId] = targetState
+
+        // Char model: rotation applied only to the visual mesh, not to container children
+        let charModel: Entity
+        if let template = blockState.characterTemplate {
+            charModel = template.clone(recursive: true)
+            let baseSize = Self.deskTargetSize * Self.characterScaleMultiplier * Self.deskAndCharacterSizeMultiplier
+            Self.scaleToBoundsSize(charModel, targetSize: baseSize / 4 * Self.characterSizeReduction)
+        } else {
+            charModel = Self.makePlaceholderDesk()
+        }
+        charModel.name = "char_model_\(agentId)"
+        charModel.position = [0, 0, 0]
+        let rotY = simd_quatf(angle: 70 * .pi / 180, axis: [0, 1, 0])
+        let rotX = simd_quatf(angle: 90 * .pi / 180, axis: [1, 0, 0])
+        charModel.orientation = rotY * rotX
+        container.addChild(charModel)
+
+        if targetState == .thinking {
+            let thinkingIndicator: Entity
+            if let template = blockState.thinkingTemplate {
+                thinkingIndicator = template.clone(recursive: true)
+                Self.scaleToBoundsSize(thinkingIndicator, targetSize: Self.targetBoundsSize * 0.8)
+            } else {
+                thinkingIndicator = Self.makeThinkingPlaceholder()
+                Self.scaleToBoundsSize(thinkingIndicator, targetSize: Self.targetBoundsSize * 0.8)
+            }
+            thinkingIndicator.name = "thinking_\(agentId)"
+            thinkingIndicator.position = [0, 0.25, 0]
+            container.addChild(thinkingIndicator)
+            blockState.thinkingIndicatorEntities[agentId] = thinkingIndicator
+        }
+
+        if targetState == .testing {
+            blockState.testingWebviewURLs[agentId] = vercelLink.isEmpty ? "https://www.google.com" : vercelLink
+            applyTestingState(container: container, agentId: agentId)
+        }
+
+        var targetTransform = container.transform
+        targetTransform.translation = [gridPos.x, targetY, gridPos.z - 1.0]
+        container.move(to: targetTransform, relativeTo: root, duration: 0.6, timingFunction: .easeOut)
+    }
+
+    /// Attaches webview and jumps container up; used when entering testing state.
+    private func applyTestingState(container: Entity, agentId: Int) {
+        if let webviewEntity = blockState.webviewEntities[agentId] {
+            webviewEntity.removeFromParent()
+            webviewEntity.position = [0, 1.0, 1.0]
+            container.addChild(webviewEntity)
+        }
+        var targetTransform = container.transform
+        targetTransform.translation.y += 1.0
+        container.move(to: targetTransform, relativeTo: container.parent, duration: 0.8, timingFunction: .easeOut)
     }
 
     private func setupHandTracking() {
