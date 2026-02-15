@@ -91,14 +91,23 @@ def _create_pr(
         "base": base,
         "body": body,
     }).encode()
-    req = urllib.request.Request(url, data=payload, method="POST", headers={
+    headers = {
         "Authorization": f"token {token}",
         "Accept": "application/vnd.github+json",
         "Content-Type": "application/json",
-    })
-    with urllib.request.urlopen(req) as resp:
-        result = json.loads(resp.read())
-    return result.get("html_url", "")
+    }
+    # Follow 307/308 redirects (urllib doesn't follow them for POST by default)
+    for _ in range(3):
+        req = urllib.request.Request(url, data=payload, method="POST", headers=headers)
+        try:
+            with urllib.request.urlopen(req) as resp:
+                result = json.loads(resp.read())
+            return result.get("html_url", "")
+        except urllib.error.HTTPError as e:
+            if e.code in (307, 308):
+                url = e.headers.get("Location", url)
+                continue
+            raise
 
 
 def _post_pr_comment(
@@ -111,19 +120,92 @@ def _post_pr_comment(
     """Post a comment on a GitHub pull request."""
     url = f"https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments"
     payload = json.dumps({"body": body}).encode()
-    req = urllib.request.Request(url, data=payload, method="POST", headers={
+    headers = {
         "Authorization": f"token {token}",
         "Accept": "application/vnd.github+json",
         "Content-Type": "application/json",
-    })
-    with urllib.request.urlopen(req) as resp:
-        resp.read()
+    }
+    for _ in range(3):
+        req = urllib.request.Request(url, data=payload, method="POST", headers=headers)
+        try:
+            with urllib.request.urlopen(req) as resp:
+                resp.read()
+            return
+        except urllib.error.HTTPError as e:
+            if e.code in (307, 308):
+                url = e.headers.get("Location", url)
+                continue
+            raise
 
 
 def _extract_pr_number(pr_url: str) -> int | None:
     """Extract PR number from a GitHub PR URL like https://github.com/owner/repo/pull/123."""
     m = re.search(r"/pull/(\d+)", pr_url)
     return int(m.group(1)) if m else None
+
+
+def _wait_for_vercel_preview(
+    owner: str,
+    repo: str,
+    pr_number: int,
+    token: str,
+    timeout: int = 300,
+) -> str | None:
+    """
+    Poll PR comments for the Vercel bot's preview URL.
+    Returns the preview URL when found, or None on timeout.
+    """
+    comments_url = f"https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments"
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github+json",
+    }
+
+    print(f"[soot] Waiting for Vercel preview deploy (polling PR #{pr_number} comments)...", flush=True)
+    start = time.time()
+
+    while time.time() - start < timeout:
+        try:
+            req = urllib.request.Request(comments_url, headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    comments = json.loads(resp.read())
+            except urllib.error.HTTPError as e:
+                if e.code in (307, 308):
+                    redirect_url = e.headers.get("Location", comments_url)
+                    req = urllib.request.Request(redirect_url, headers=headers)
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        comments = json.loads(resp.read())
+                else:
+                    raise
+
+            for comment in comments:
+                body = comment.get("body", "")
+                user = comment.get("user", {}).get("login", "")
+                # Vercel bot comments with preview URLs
+                if "vercel" in user.lower() or "vercel" in body.lower():
+                    # Only proceed if the deployment is actually ready (not still building)
+                    if "ready" not in body.lower():
+                        elapsed = int(time.time() - start)
+                        print(f"[soot] Vercel comment found but still building ({elapsed}s)...", flush=True)
+                        continue
+                    # Extract preview URL — Vercel uses *.vercel.app links
+                    url_match = re.search(r"https://[a-zA-Z0-9\-]+\.vercel\.app", body)
+                    if url_match:
+                        preview_url = url_match.group(0)
+                        elapsed = int(time.time() - start)
+                        print(f"[soot] Vercel preview ready ({elapsed}s): {preview_url}", flush=True)
+                        return preview_url
+        except Exception as e:
+            elapsed = int(time.time() - start)
+            print(f"[soot] Polling error ({elapsed}s): {e}", flush=True)
+
+        elapsed = int(time.time() - start)
+        print(f"[soot] No Vercel comment yet ({elapsed}s)...", flush=True)
+        time.sleep(10)
+
+    print(f"[soot] Timed out waiting for Vercel preview ({timeout}s)", flush=True)
+    return None
 
 
 def _run_browser_smoke_test(
@@ -334,8 +416,6 @@ def run_modal_agent(
     repo_url: str,
     system_prompt: str | None = None,
     smoke_test: bool = False,
-    start_command: str | None = None,
-    app_port: int = 3000,
 ) -> str:
     """
     Run claude-agent-sdk in a Modal sandbox, then push a branch and open a PR.
@@ -346,7 +426,7 @@ def run_modal_agent(
       3. Run claude-agent-sdk with the user instruction (drops root → agent)
       4. Stage + commit + push any changes the agent made
       5. Open a GitHub pull request via the API
-      6. (Optional) Start the app, expose via tunnel, run Browserbase smoke test
+      6. (Optional) Wait for Vercel preview deploy, then run Browserbase smoke test
     """
     try:
         import modal
@@ -378,9 +458,6 @@ def run_modal_agent(
         # ── Create sandbox ────────────────────────────────────────────
         print("[soot] Creating Modal sandbox...", flush=True)
         sandbox_kwargs: dict = dict(app=app, image=sandbox_image, timeout=10 * 60)
-        if smoke_test:
-            # Expose common app ports so we can create a tunnel later
-            sandbox_kwargs["encrypted_ports"] = [app_port]
         with modal.enable_output():
             sb = modal.Sandbox.create(**sandbox_kwargs)
         print("[soot] Sandbox created.", flush=True)
@@ -488,42 +565,18 @@ def run_modal_agent(
 
         print(f"[soot] PR created: {pr_url}", flush=True)
 
-        # ── 7. (Optional) Smoke test via Browserbase ─────────────────
+        # ── 7. (Optional) Smoke test via Browserbase + Vercel preview ──
         smoke_result = ""
         if smoke_test:
-            print("[soot] Starting app for smoke test...", flush=True)
             try:
-                # Determine start command: user-provided or try common defaults
-                if start_command:
-                    cmd_parts = start_command.split()
-                else:
-                    # Try to detect: check for package.json → npm start, else python http.server
-                    pkg_check, _, pkg_rc = _exec(sb, "test", "-f", "/repo/package.json")
-                    if pkg_rc == 0:
-                        # Install deps first
-                        _exec(sb, "npm", "install", workdir="/repo", timeout=120)
-                        cmd_parts = ["npm", "start"]
-                    else:
-                        cmd_parts = ["python", "-m", "http.server", str(app_port)]
+                # Wait for Vercel bot to comment with the preview URL
+                pr_number = _extract_pr_number(pr_url)
+                preview_url = _wait_for_vercel_preview(
+                    owner, repo_name, pr_number, github_token, timeout=300,
+                )
 
-                # Start app (non-blocking — don't call .wait())
-                app_proc = sb.exec(*cmd_parts, workdir="/repo")
-
-                # Wait for the tunnel to become available
-                print(f"[soot] Waiting for tunnel on port {app_port}...", flush=True)
-                tunnel_url = None
-                for _ in range(30):  # poll for up to 30 seconds
-                    time.sleep(1)
-                    try:
-                        tunnels = sb.tunnels()
-                        if app_port in tunnels:
-                            tunnel_url = tunnels[app_port].url
-                            break
-                    except Exception:
-                        pass
-
-                if tunnel_url:
-                    print(f"[soot] Tunnel ready: {tunnel_url}", flush=True)
+                if preview_url:
+                    print(f"[soot] Running Browserbase smoke test against {preview_url}...", flush=True)
                     # Run Playwright in a separate thread — its sync API
                     # crashes if called from inside an asyncio event loop
                     # (the MCP server is async).
@@ -531,7 +584,7 @@ def run_modal_agent(
                     with ThreadPoolExecutor(max_workers=1) as pool:
                         smoke_result = pool.submit(
                             _run_browser_smoke_test,
-                            tunnel_url=tunnel_url,
+                            tunnel_url=preview_url,
                             pr_url=pr_url,
                             owner=owner,
                             repo_name=repo_name,
@@ -539,7 +592,7 @@ def run_modal_agent(
                         ).result()
                     print(f"[soot] {smoke_result}", flush=True)
                 else:
-                    smoke_result = "Smoke test skipped: tunnel did not become available within 30s."
+                    smoke_result = "Smoke test skipped: Vercel preview deploy did not complete within 5 minutes."
                     print(f"[soot] {smoke_result}", flush=True)
 
             except Exception as e:
@@ -569,8 +622,6 @@ def run_fix(
     instruction: str,
     repo_url: str = DEFAULT_REPO_URL,
     smoke_test: bool = False,
-    start_command: str = "",
-    app_port: int = 3000,
 ) -> str:
     """
     Run a fix instruction in a Modal sandbox with Claude Agent SDK, then push a branch and open a PR.
@@ -579,14 +630,12 @@ def run_fix(
     runs the Claude Agent SDK with your instruction, and automatically
     commits, pushes, and opens a GitHub pull request with the changes.
 
-    Optionally runs a Browserbase smoke test on the live app after the PR is created.
+    Optionally waits for Vercel preview deploy, then runs a Browserbase smoke test.
 
     Args:
         instruction: What to fix or change (e.g., "Fix the bug in auth.py" or "Add a test for login")
         repo_url: GitHub HTTPS URL to clone (defaults to treehacks-agent-repo)
-        smoke_test: If true, start the app after PR and run a browser smoke test via Browserbase
-        start_command: Command to start the app for smoke test (e.g. "npm start"). Auto-detected if empty.
-        app_port: Port the app listens on (default 3000)
+        smoke_test: If true, wait for Vercel preview deploy and run a browser smoke test via Browserbase
 
     Returns:
         The PR URL, agent output, and optional smoke test results
@@ -597,8 +646,6 @@ def run_fix(
             repo_url=repo_url,
             system_prompt=FIX_SYSTEM_PROMPT,
             smoke_test=smoke_test,
-            start_command=start_command or None,
-            app_port=app_port,
         )
         return result
     except Exception as e:
