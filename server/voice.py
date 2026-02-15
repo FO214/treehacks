@@ -51,6 +51,8 @@ SILENCE_THRESHOLD = os.environ.get("SILENCE_THRESHOLD") or "5%"
 SILENCE_START_DURATION = os.environ.get("SILENCE_START_DURATION") or "0.1"
 SILENCE_STOP_DURATION = os.environ.get("SILENCE_STOP_DURATION") or "1.0"
 RECORD_SAMPLE_RATE = os.environ.get("RECORD_SAMPLE_RATE") or ""
+# Max recording duration (seconds) for speech-to-text; recording stops at silence or this limit
+RECORD_MAX_SECONDS = int(os.environ.get("RECORD_MAX_SECONDS") or "15")
 
 SOUND_EFFECTS_ENABLED = (os.environ.get("SOUND_EFFECTS_ENABLED") or "true").lower() != "false"
 SOUND_EFFECTS_DIR = os.environ.get("SOUND_EFFECTS_DIR") or str(Path.cwd() / "sound-effects")
@@ -135,6 +137,10 @@ def _sqlite_int(val) -> str:
 def _sanitize_tts(text: str) -> str:
     if not text:
         return ""
+    # Don't speak messages containing these domains
+    for domain in ("view-email.cx", "authorize.cx"):
+        if domain in text:
+            text = text.replace(domain, "")
     # Remove emoji (common ranges)
     emoji_pattern = re.compile(
         "["
@@ -335,10 +341,13 @@ def _record_until_pause(output_path: str) -> None:
             SILENCE_STOP_DURATION, SILENCE_THRESHOLD]
     if RECORD_SAMPLE_RATE:
         args = ["-r", RECORD_SAMPLE_RATE] + args
-    if RECORD_BIN == "rec":
-        _run_cmd(["rec"] + args, inherit_stdio=True)
-    else:
-        _run_cmd(["sox", "-d"] + args, inherit_stdio=True)
+    cmd = (["rec"] if RECORD_BIN == "rec" else ["sox", "-d"]) + args
+    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        proc.wait(timeout=RECORD_MAX_SECONDS)
+    except subprocess.TimeoutExpired:
+        proc.terminate()
+        proc.wait(timeout=2)
 
 
 def _transcribe_audio(audio_path: str) -> str:
@@ -412,6 +421,9 @@ def _play_notification_sound(filename: str) -> None:
 
 
 def _speak_text(text: str) -> None:
+    text = _sanitize_tts(text or "")
+    if not text:
+        return
     fmt = "mp3" if PROVIDER == "other" else TTS_FORMAT
     ext = "mp3" if fmt == "mp3" else ("pcm" if fmt == "pcm" else "wav")
     out = _temp_audio_path("voice-out", ext)
